@@ -1,0 +1,178 @@
+name: 00 - Flutter bootstrap (temporary)
+
+# A branch push works before this workflow exists on the default branch.
+# Remove this generator after the reviewed source has been imported.
+on:
+  push:
+    branches:
+      - codex/flutter-bootstrap
+    paths:
+      - .github/workflows/00-bootstrap.yml
+      - .fvmrc
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flutter-bootstrap-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    if: github.repository == 'sirarikako/PolyxiaBannerData.ManualEditor' && github.ref == 'refs/heads/codex/flutter-bootstrap'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CI: 'true'
+      FLUTTER_FRAMEWORK_REVISION: abaf9c523780a608bd46686fd5e53740a07077f8
+
+    steps:
+      - name: Check out the approved source commit
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Validate the version pin and isolated output paths
+        id: config
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pin = Get-Content -LiteralPath .fvmrc -Raw | ConvertFrom-Json
+          if ($pin.flutter -notmatch '^\d+\.\d+\.\d+$') {
+            throw 'A complete, non-floating Flutter version is required.'
+          }
+          if (Test-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'pubspec.yaml')) {
+            throw 'A project already exists; review it instead of regenerating it.'
+          }
+          $projectRoot = Join-Path $env:RUNNER_TEMP 'polyxia-bootstrap-project'
+          $artifactRoot = Join-Path $env:RUNNER_TEMP 'polyxia-bootstrap-artifact'
+          foreach ($outputPath in @($projectRoot, $artifactRoot)) {
+            if (Test-Path -LiteralPath $outputPath) { throw 'Output path already exists.' }
+          }
+          "flutter_version=$($pin.flutter)" >> $env:GITHUB_OUTPUT
+          "BOOTSTRAP_PROJECT=$projectRoot" >> $env:GITHUB_ENV
+          "BOOTSTRAP_ARTIFACT=$artifactRoot" >> $env:GITHUB_ENV
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free
+
+      - name: Install the pinned Flutter SDK on the runner only
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ steps.config.outputs.flutter_version }}
+          architecture: x64
+          cache: true
+          pub-cache: false
+
+      - name: Verify the SDK and generate the official project
+        run: |
+          $ErrorActionPreference = 'Stop'
+          flutter --disable-analytics
+          if ($LASTEXITCODE -ne 0) { throw 'Could not disable runner analytics.' }
+          $versionJson = flutter --version --machine | Out-String
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read the Flutter version.' }
+          $sdk = $versionJson | ConvertFrom-Json
+          $pin = Get-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE '.fvmrc') -Raw | ConvertFrom-Json
+          if ($sdk.frameworkVersion -ne $pin.flutter -or $sdk.channel -ne 'stable' -or
+              $sdk.frameworkRevision -ne $env:FLUTTER_FRAMEWORK_REVISION) {
+            throw 'Installed SDK does not match the reviewed stable release.'
+          }
+          $versionJson | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'polyxia-flutter-version.json') -Encoding utf8
+          Write-Output "Flutter $($sdk.frameworkVersion); Dart $($sdk.dartSdkVersion)"
+          flutter create --no-pub --platforms=android,windows --org io.github.sirarikako --project-name polyxia_banner_data_manual_editor $env:BOOTSTRAP_PROJECT
+          if ($LASTEXITCODE -ne 0) { throw 'Official Flutter project generation failed.' }
+          Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE '.fvmrc') -Destination (Join-Path $env:BOOTSTRAP_PROJECT '.fvmrc')
+
+      - name: Resolve dependencies and validate the generated template
+        working-directory: ${{ env.BOOTSTRAP_PROJECT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          flutter pub get
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency resolution failed.' }
+          flutter analyze --no-pub
+          if ($LASTEXITCODE -ne 0) { throw 'Flutter analysis failed.' }
+          flutter test --no-pub
+          if ($LASTEXITCODE -ne 0) { throw 'Flutter tests failed.' }
+          dart format --output=none --set-exit-if-changed .
+          if ($LASTEXITCODE -ne 0) { throw 'Dart format check failed.' }
+
+      - name: Export only source files eligible for version control
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $projectRoot = [IO.Path]::GetFullPath($env:BOOTSTRAP_PROJECT)
+          $sourceRoot = Join-Path $env:BOOTSTRAP_ARTIFACT 'source'
+          New-Item -ItemType Directory -Path $sourceRoot | Out-Null
+          # Use the generated ignore rules, without staging or committing anything.
+          git -C $projectRoot init --quiet
+          if ($LASTEXITCODE -ne 0) { throw 'Could not inspect generated ignore rules.' }
+          $sourceFiles = @(git -C $projectRoot -c core.quotePath=false ls-files --others --exclude-standard)
+          if ($LASTEXITCODE -ne 0 -or $sourceFiles.Count -eq 0) { throw 'No generated source files found.' }
+          $fileManifest = @()
+          foreach ($relativePath in ($sourceFiles | Sort-Object)) {
+            if ($relativePath -notmatch '^(\.gitignore|\.gitattributes|\.metadata|\.fvmrc|analysis_options\.yaml|pubspec\.yaml|pubspec\.lock|README\.md|(android|windows|lib|test)/.+)$' -or
+                [IO.Path]::IsPathRooted($relativePath) -or $relativePath -match '(^|/)\.\.(/|$)' -or
+                $relativePath -match '(^|/)(\.git|\.dart_tool|\.gradle|\.idea|\.fvm|build|ephemeral)(/|$)' -or
+                $relativePath -match '(^|/)(\.env(?:\..*)?|local\.properties|key\.properties|\.flutter-plugins(?:-dependencies)?|AGENTS\.md|docs)(/|$)' -or
+                $relativePath -match '\.(jks|keystore|p12|pfx|pem|key|iml)$') {
+              throw "Unexpected file in source export: $relativePath"
+            }
+            $inputPath = [IO.Path]::GetFullPath((Join-Path $projectRoot $relativePath))
+            if (-not $inputPath.StartsWith($projectRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+              throw 'Source path escapes the generated project.'
+            }
+            $componentPath = $projectRoot
+            foreach ($component in ($relativePath -split '/')) {
+              $componentPath = Join-Path $componentPath $component
+              if (((Get-Item -LiteralPath $componentPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'Linked files or directories are not allowed in the source export.'
+              }
+            }
+            $outputPath = Join-Path $sourceRoot $relativePath
+            New-Item -ItemType Directory -Path (Split-Path -Parent $outputPath) -Force | Out-Null
+            Copy-Item -LiteralPath $inputPath -Destination $outputPath
+            $fileManifest += [ordered]@{
+              path = $relativePath
+              sha256 = (Get-FileHash -LiteralPath $outputPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+          }
+          foreach ($requiredFile in @('.gitignore', '.metadata', '.fvmrc', 'pubspec.yaml', 'pubspec.lock',
+              'lib/main.dart', 'test/widget_test.dart', 'android/app/src/main/AndroidManifest.xml',
+              'windows/CMakeLists.txt', 'windows/runner/main.cpp')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $sourceRoot $requiredFile) -PathType Leaf)) {
+              throw "Required source file missing: $requiredFile"
+            }
+          }
+          $workspaceChanges = @(git -C $env:GITHUB_WORKSPACE status --porcelain=v1 --untracked-files=all)
+          if ($LASTEXITCODE -ne 0 -or $workspaceChanges.Count -ne 0) { throw 'The checked-out repository was modified.' }
+          $sdk = Get-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'polyxia-flutter-version.json') -Raw | ConvertFrom-Json
+          [ordered]@{
+            repository = $env:GITHUB_REPOSITORY
+            workflowCommit = $env:GITHUB_SHA
+            runId = $env:GITHUB_RUN_ID
+            runAttempt = $env:GITHUB_RUN_ATTEMPT
+            flutterVersion = $sdk.frameworkVersion
+            flutterRevision = $sdk.frameworkRevision
+            dartVersion = $sdk.dartSdkVersion
+            scope = 'Fresh official template only; not the final repository or PR source.'
+            checks = @('flutter analyze --no-pub', 'flutter test --no-pub', 'dart format --output=none --set-exit-if-changed .')
+            files = $fileManifest
+          } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $env:BOOTSTRAP_ARTIFACT 'bootstrap-manifest.json') -Encoding utf8
+          $sourceBytes = (Get-ChildItem -LiteralPath $sourceRoot -Recurse -File -Force | Measure-Object Length -Sum).Sum
+          Write-Output "Exported $($sourceFiles.Count) files; source bytes: $sourceBytes"
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free
+
+      - name: Upload generated source and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-bootstrap-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.BOOTSTRAP_ARTIFACT }}/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: false
+
+      - name: Record the validation boundary
+        run: |
+          'Generated template checks passed. Imported or DSH-modified source still requires CI for its own commit.' >> $env:GITHUB_STEP_SUMMARY
+          'No Android/Windows release build or device acceptance was performed.' >> $env:GITHUB_STEP_SUMMARY
