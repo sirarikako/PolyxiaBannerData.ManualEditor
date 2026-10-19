@@ -1,54 +1,94 @@
-# Flutter 云端初始化准备与验收
+# Flutter 云端初始化与工程导入记录
 
-本任务经用户明确调整为云端初始化：本地暂不安装 Flutter SDK，使用 GitHub Windows Runner 上的官方 `flutter create` 生成工程。这是对当前初始化任务执行位置的授权，不降低 [AGENTS.md](../AGENTS.md)、[协作流程](agent-workflow.md)、[检查清单](agent-review-checklist.md) 与 [CI 方针](ci-build-release.md) 的验收要求。原有四份规范和用户文件保持原样。
+本项目经用户授权在 GitHub Windows Runner 使用官方 `flutter create` 生成 Android / Windows 工程，再由 Codex 校验 Artifact 并导入仓库根目录。本地 Windows VM 暂未安装 Flutter SDK。本记录补充当前任务证据；协作分工、验收和返工规则仍以 [AGENTS.md](../AGENTS.md)、[协作流程](agent-workflow.md)、[检查清单](agent-review-checklist.md) 和 [CI 方针](ci-build-release.md) 为准，原有四份规范未修改。
 
-## 固定版本与标识建议
+## 1. 固定版本与生成来源
 
-- `.fvmrc` 固定 Flutter **3.47.7 stable**，对应 Dart **3.13.5**、框架提交 `abaf9c523780a608bd46686fd5e53740a07077f8`。
-- 选择依据：官方 [Windows 发布清单](https://storage.googleapis.com/flutter_infra_release/releases/releases_windows.json) 列明该版本于 2026-10-08 发布；[Linux 发布清单](https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json) 也提供同版本、同框架提交的稳定 SDK，适合后续 Windows 与 Ubuntu Runner。可从 [官方 SDK 归档](https://docs.flutter.dev/install/archive) 核对。
-- 工作流从 `.fvmrc` 读取完整版本，通过用户指定的 `subosito/flutter-action@v2` 安装；安装后核对版本、stable 渠道和框架提交，不回退到浮动版本。仅缓存 Runner 的 Flutter SDK，本次不缓存尚无固定锁文件的 pub 依赖。
-- 项目名：`polyxia_banner_data_manual_editor`。`--org io.github.sirarikako` 是基于现有 GitHub 命名的开发命名空间建议；实际生成的 Android applicationId 必须在 Artifact Review 中核对，未认定为最终发布标识。
-- Windows 产品名建议为 `PolyxiaBannerData.ManualEditor`，程序名建议为 `polyxia_banner_data_manual_editor.exe`。本次官方模板生成不配置 MSIX 或正式发布身份。
+- `.fvmrc` 固定 Flutter **3.47.7 stable**，对应 Dart **3.13.5**，框架提交 `abaf9c523780a608bd46686fd5e53740a07077f8`。
+- 原选择依据：官方 [Windows 发布清单](https://storage.googleapis.com/flutter_infra_release/releases/releases_windows.json) 列明该版本于 2026-10-08 发布；[Linux 发布清单](https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json) 提供同版本、同框架提交的稳定 SDK，适用于后续 Windows 和 Ubuntu Runner。版本可从 [官方 SDK 归档](https://docs.flutter.dev/install/archive) 核对；实际安装版本也已由初始化 Run 验证。
+- 来源仓库：`sirarikako/PolyxiaBannerData.ManualEditor`；分支：`codex/flutter-bootstrap`。
+- 生成工作流提交：`93c35064eb7238659a0d5a8f366af4039d8a698a`。
+- [初始化 Run #1](https://github.com/sirarikako/PolyxiaBannerData.ManualEditor/actions/runs/39240066092)：Run ID `39240066092`，attempt `1`，状态 `success`，Windows Runner 所有步骤成功。
 
-## 本次待推送文件与触发
+Runner 在独立临时目录执行以下官方命令，未覆盖仓库检出目录：
 
-仅新增 `.fvmrc`、`.github/workflows/00-bootstrap.yml` 和本说明。当前阶段仅完成本地准备和静态审查，不推送、不触发 Actions、不生成业务代码，也不创建正式 Release。
+```powershell
+flutter create --no-pub --platforms=android,windows --org io.github.sirarikako --project-name polyxia_banner_data_manual_editor <Runner临时目录>
+```
 
-批准后，在审查提交范围并创建本地提交后，仅推送 `codex/flutter-bootstrap`。工作流仅响应该分支中 `.fvmrc` 或 `00-bootstrap.yml` 的 push 变化，并再次核对仓库和分支。**推送该提交即会启动云端初始化**，不能把推送与触发视为两个互不相关的动作。
+随后执行依赖恢复、analyze、test 和格式检查，仅在检查成功后导出符合版本管理要求的源文件。临时工作流 `00-bootstrap.yml` 已在本次导入中删除；既有提交、Run 及 Actions 日志未删除，不再保留可重复生成模板的入口。
 
-不使用首次 `workflow_dispatch` 作为入口：该事件要求工作流存在于默认分支，详见 [GitHub 事件文档](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch)。本方案无需为初始化修改或合并 `main`。
+## 2. Artifact 与完整性校验
 
-工作流使用 `windows-latest`、30 分钟 Job 时限和 `contents: read`，其余 Token 权限不授予；checkout 不保留凭据。无需仓库 Secret、AI Key、私有数据访问或 Release 写权限；不运行 AI Agent、不自动提交或推送。首次推送所用的开发者凭据需允许推送分支和新增工作流文件，属于用户批准后的 Git 操作权限，不是 Runner Token 权限。
+| 项目 | 独立核查结果 |
+| --- | --- |
+| Artifact | `flutter-bootstrap-93c35064eb7238659a0d5a8f366af4039d8a698a-39240066092-1` |
+| Artifact ID | `12181425798` |
+| 下载 ZIP 大小 | 53,461 字节 |
+| ZIP SHA256 | `f635d61e1071a870dc2abcaf24c51f9e1adb6a92cbb67eedef89c3a054bb3cee` |
+| 保留期限 | 7 天；到期时间 `2026-10-26T10:51:17Z`；本次下载时未过期 |
+| 包内内容 | `bootstrap-manifest.json` 与 `source/` 下 46 个源文件 |
+| 清单校验 | 仓库、源提交、Run / attempt、Flutter / Dart 版本与指定来源一致 |
+| 源文件 SHA256 | 全部 46 个逐项重新计算，与清单一致 |
 
-## 云端执行和 Artifact 范围
+下载与解包在仓库外的独立临时目录进行；导入前拒绝绝对路径、路径越界、大小写重复、符号链接和意外文件。检查包含隐藏配置文件，未发现 SDK、缓存、凭据、签名密钥、私有数据或编译中间产物。ZIP 摘要用于核对下载包，每个源文件另行核对，不能互相替代。
 
-1. 在 Runner 临时目录调用固定版本的官方命令：
+实际新增导入 **45 个文件**，复制后的工作区内容与清单逐字节一致；已有 `.fvmrc` 与 Artifact 内容一致（仅换行形式不同），保留本地原始字节，未盲目覆盖。仓库现有 `core.autocrlf=true` 在暂存时将其中 34 个文本文件的 CRLF 正常化为 LF；已逐项确认暂存内容仅有这一换行差异，没有其他改写。没有其他目标文件冲突；既有文档和用户文件均保留。临时下载包与解包目录位于仓库外，未纳入提交；清理操作及收窄为逐文件删除、仅移除空目录的方案均被自动审批检查拒绝，返回 `blocked by policy`，因此保留现场，需用户另行清理本次 TEMP 下的 `PolyxiaFlutterImport-*` 目录。
 
-   ```powershell
-   flutter create --no-pub --platforms=android,windows --org io.github.sirarikako --project-name polyxia_banner_data_manual_editor <Runner临时目录>
-   ```
+| 源文件分组 | Artifact 数量 | 本次新增数量 |
+| --- | ---: | ---: |
+| 根目录配置、README、依赖清单与锁文件 | 7 | 6（已有 `.fvmrc` 跳过） |
+| `android/` | 19 | 19 |
+| `windows/` | 18 | 18 |
+| `lib/` | 1 | 1 |
+| `test/` | 1 | 1 |
+| 合计 | 46 | 45 |
 
-2. 不在仓库检出目录运行 create；若仓库已有 `pubspec.yaml`，拒绝重新生成。生成目录和导出目录已存在时也拒绝覆盖；用户文件不会被复制进生成目录。
-3. 在生成目录执行 `flutter pub get`、`flutter analyze --no-pub`、`flutter test --no-pub`、`dart format --output=none --set-exit-if-changed .`。任何非零退出码使 Job 失败，不删除测试、不弱化校验；只有检查成功后才导出并上传源文件。
-4. 导出遵守官方生成的 Git 忽略规则，限制为基础配置和 `android/`、`windows/`、`lib/`、`test/` 中的源文件，并额外拒绝缓存、构建目录、链接文件或目录、路径越界、凭据配置和签名密钥。保留 `pubspec.lock`、平台源文件、`.gitignore`、`.metadata`、`.fvmrc` 等需要版本管理的文件；不打包 `.git`、SDK、`.dart_tool`、Gradle / IDE 缓存、`local.properties`、临时插件配置或编译中间产物。
-5. Artifact 包含 `source/` 和 `bootstrap-manifest.json`；清单记录触发提交、Run、实际 SDK、校验命令以及每个源文件的 SHA256。`source/` 的内容将来对应仓库根目录，不能导入成额外的一层 Flutter 子项目。
-6. 上传只针对独立导出目录，设置 `include-hidden-files: true`、文件缺失报错和 7 天保留，不上传整个检出目录或 Runner 临时目录。隐藏文件规则见 [upload-artifact 文档](https://github.com/actions/upload-artifact#uploading-hidden-files)。仓库策略、Action 和 Runner 实际可用性须由真实 Run 确认，本地静态审查不能替代。
+保留 `.gitignore`、`.metadata`、Android / Windows 的隐藏忽略文件及 `pubspec.lock`。Gradle 缓存、`local.properties`、临时插件配置及官方忽略的 Gradle wrapper 运行文件不属于此次源文件导出；未手工仿造或补造平台模板。
 
-## 下载、Review 与后续 DSH 任务
+## 3. 导入后的静态 Review
 
-- 用户批准推送后，Codex 检查实际 Run 的 SHA、步骤退出结果和 Artifact；失败时先分析原因，不因缺少本地 SDK 让 DSH 手工重造平台模板。
-- 下载后先在隔离目录解包，拒绝绝对路径、`..`、链接和意外文件，核对清单中的所有文件及 SHA256、固定版本和实际平台配置，再决定是否导入。不得直接向仓库根目录覆盖解压。
-- 导入前逐项检查目标冲突，保留既有 `AGENTS.md`、`docs/` 及其他用户文件；已有同名文件只在内容一致时跳过，不一致时停止并报告，不使用强制覆盖。现有 `.fvmrc` 应与 Artifact 中的副本一致。
-- 初始 Artifact 是官方演示工程及其默认 Widget 测试，**尚不是最终最小应用界面**。Codex Review 后，可按用户已授权的开发范围调用本地 DSH 调整应用名称、最小界面、基础测试，移除不必要的模板依赖和演示功能；不得开发 JSON 业务功能或自行手写 Android / Windows 平台模板。
-- DSH 是后续主要开发执行者，Codex 独立审查实际 Diff。保留初次开发和本地 / CI 共享最多 3 轮返工的规则，按调用实际情况记录次数；本阶段未调用 DSH，不消耗返工轮次。
+- 工程位于仓库根目录，项目名为 `polyxia_banner_data_manual_editor`；Android Gradle / Manifest / Kotlin 入口和 Windows CMake / runner / 资源文件存在。
+- `pubspec.yaml` 使用 Flutter SDK、官方模板的 `cupertino_icons`、`flutter_test` 和 `flutter_lints`；`publish_to: none`，Dart 约束为 `^3.13.5`。保留官方生成的 `pubspec.lock`，托管依赖指向公开 `pub.dev` 并记录内容哈希；本次未新增第三方依赖或重解锁依赖。
+- `.gitignore` 保留官方缓存、IDE 与构建产物忽略规则，`pubspec.lock`、`.metadata` 和 `.fvmrc` 纳入版本管理。
+- `lib/main.dart` 仍为官方 Counter 演示页面；`test/widget_test.dart` 使用正确的包导入并验证计数器从 0 增加至 1。此次未修改页面、测试、业务功能或模板依赖。
+- Android namespace / applicationId 当前为 `io.github.sirarikako.polyxia_banner_data_manual_editor`；模板 release 仍使用 debug 签名配置。它们属于开发阶段配置，未确认正式发布身份与签名方案。
+- Windows 程序名为 `polyxia_banner_data_manual_editor.exe`；资源中的 ProductName / FileDescription / InternalName 为 `polyxia_banner_data_manual_editor`，CompanyName 为 `io.github.sirarikako`。正式显示名称、发布身份与打包方案尚待后续确认；本次不配置 MSIX。
 
-## 验收状态与退出边界
+本次仅导入官方工程、替换临时工作流及更新本记录。提交前已核查敏感信息、实际 Git Diff、隐藏文件和生成物范围；`git diff --cached --check` 通过，8 个 XML 文件可解析，8 个缓存 / 本地配置示例路径被正确忽略，5 个必要配置路径未被忽略。工作流 YAML 语法和结构已人工审查，触发条件、权限、命令与缓存配置另经脚本断言检查，两个内嵌 Python 脚本通过 AST 语法检查；这些静态检查不能替代 GitHub 执行。
 
-本次本地准备检查包括：分支及基线、固定版本依据、工作流结构与 PowerShell 语法、原文件保护、权限和 Artifact 边界、敏感信息与 Git Diff 范围。仅这些检查可以在本地完成。
+## 4. 正式快速 CI
 
-- 本地 Flutter analyze / test / format：**未执行，本地无 SDK**。
-- 云端初始化及生成模板的 analyze / test / format：**待用户批准推送后执行**，当前不能标记通过。
-- 最终工程或 DSH 修改后的提交 CI：**未执行**。首次 Artifact 中的模板检查不能当作最终 PR 提交的 CI；源文件导入、修改并提交后，仍须经批准建立或使用对应提交的 CI，结果必须关联该提交。
-- Windows / Android 完整构建及实机验收：**未执行**；本临时工作流不执行这些构建和设备测试。
+新增 [`.github/workflows/01-ci.yml`](../.github/workflows/01-ci.yml)，采用以下契约：
 
-Artifact 独立 Review、本地 DSH 修改、最终提交 CI 和用户验收全部达到任务要求后，才可声明 Flutter 初始化完整验收通过。完成源文件导入后应在获准范围内移除临时生成工作流，避免把它误用为正式 CI；本说明不提前授权任何远端写入、合并或发布。
+- `pull_request` 目标为 `main`，以及 `push` 到 `main`；推送 `codex/flutter-bootstrap` 本身不会触发该工作流。后续经用户授权推送并创建面向 `main` 的 PR 后，才验证导入后的正式代码。
+- 使用 `ubuntu-latest`、20 分钟 Job 时限、`contents: read`，checkout 不保留凭据；不使用 `pull_request_target`、仓库 Secret、AI 凭据或私有数据，不运行 AI Agent、不写入仓库。
+- 从 `.fvmrc` 读取完整版本，拒绝浮动版本；通过 `subosito/flutter-action@v2` 安装 stable SDK，核对实际 Flutter 版本及渠道并记录 Flutter / Dart 信息。
+- Flutter SDK 缓存按 OS、架构和 `.fvmrc` 隔离；pub 缓存额外包含锁文件哈希。缓存只保存 SDK / pub 包，不保存整个工作区或凭据。
+- 依次执行 `flutter pub get --enforce-lockfile`、`dart format --output=none --set-exit-if-changed .`、`flutter analyze --no-pub`、`flutter test --no-pub`，最后检查已跟踪源码无变化。锁文件不一致时失败，不自动更新提交；`--enforce-lockfile` 的作用见 [Dart pub get 文档](https://dart.dev/tools/pub/cmd/pub-get)。
+- 记录事件 SHA、PR head SHA、实际 checkout SHA，以及初始 / 最终磁盘和相关缓存 / 输出目录占用。PR 默认检测合并测试提交，不能把 PR head SHA 与实际受测 SHA 混为一谈。
+- 不执行 Android / Windows 完整构建、不上传构建包、不发布 Release、不自动提交或合并；任一必要检查失败即保留失败状态。
+
+`02-build.yml` 和 `03-release.yml` 尚未建立。工作流的静态审查不等于 GitHub 实际运行验证。
+
+## 5. 分层验收状态
+
+| 验证项 | 当前状态与证据 |
+| --- | --- |
+| 官方模板云端 analyze | 通过；上述初始化 Run 执行 `flutter analyze --no-pub`，无问题 |
+| 官方模板云端 Widget test | 通过；上述 Run 的 1 个 Counter smoke test 成功 |
+| 官方模板云端 format | 通过；上述 Run 检查 2 个 Dart 文件，0 个变更 |
+| Artifact 与导入完整性 | 46 / 46 清单哈希匹配；45 个新增文件复制后再次匹配；已有版本文件保持原样 |
+| 本次临时下载清理 | **未完成，自动审批检查拒绝清理操作**；文件仍在仓库外，未纳入提交 |
+| 导入后的本地静态 Review | 通过；检查平台配置、依赖、忽略规则、文件范围、敏感信息、工作流配置与 Git Diff |
+| 本地 Flutter analyze / test / format | **未执行，本地无 Flutter SDK** |
+| 导入后正式提交的 `01-ci.yml` | **未执行，尚未推送或创建 PR**；模板历史测试不能替代该提交的 CI |
+| 最终代码验收 | **待当前提交 CI**；此次仅完成工程导入和配置静态审查 |
+| Windows / Android 云端完整构建 | **未执行** |
+| Windows / Android 实机验收 | **未执行** |
+
+## 6. 后续边界
+
+本次按用户授权只建立本地提交，不推送、不创建 PR、不合并 `main`。后续可在得到授权后推送 Feature Branch、创建 PR，检查对应提交的 `01-ci.yml` 实际结果；之后再单独安排最小应用主页开发。
+
+用户明确允许 Codex 完成官方文件导入和 CI 配置审查，本次 **DSH 开发调用 0 次，返工 0 轮**。后续业务实现仍由本地 DSH 执行，Codex 独立 Review；本地与 CI 返工共享最多 3 轮的规则不变。缺少本地 SDK 时继续如实记录未执行项，不降低验收标准，不让 DSH 手工重造 Flutter 平台模板。
