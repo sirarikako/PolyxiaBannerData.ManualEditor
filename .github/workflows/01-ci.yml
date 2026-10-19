@@ -1,0 +1,104 @@
+name: 01 - Flutter CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flutter-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: 'true'
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Record source and initial disk space
+        run: |
+          printf 'Event SHA: %s\nPR head SHA: %s\nCheckout SHA: ' "$GITHUB_SHA" "$PR_HEAD_SHA"
+          git rev-parse HEAD
+          df -h .
+
+      - name: Validate the fixed Flutter version
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import re
+
+          version = json.loads(pathlib.Path('.fvmrc').read_text())['flutter']
+          if not isinstance(version, str) or not re.fullmatch(r'\d+\.\d+\.\d+', version):
+              raise SystemExit('An exact Flutter version is required in .fvmrc')
+          print(f'Pinned Flutter: {version} stable')
+          PY
+
+      - name: Set up the pinned Flutter SDK and caches
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          architecture: x64
+          cache: true
+          cache-key: flutter-sdk-${{ runner.os }}-x64-${{ hashFiles('.fvmrc') }}
+          pub-cache: true
+          pub-cache-key: flutter-pub-${{ runner.os }}-x64-${{ hashFiles('.fvmrc', 'pubspec.lock') }}
+
+      - name: Verify and record the actual SDK
+        run: |
+          flutter --disable-analytics
+          dart --disable-analytics
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import subprocess
+
+          expected = json.loads(pathlib.Path('.fvmrc').read_text())['flutter']
+          actual = json.loads(subprocess.check_output(['flutter', '--version', '--machine'], text=True))
+          if actual['frameworkVersion'] != expected or actual['channel'] != 'stable':
+              raise SystemExit('Installed Flutter SDK does not match .fvmrc and stable')
+          print(json.dumps(actual, indent=2))
+          PY
+
+      - name: Restore locked dependencies
+        run: flutter pub get --enforce-lockfile
+
+      - name: Check Dart formatting
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: Analyze the project
+        run: flutter analyze --no-pub
+
+      - name: Run Flutter tests
+        run: flutter test --no-pub
+
+      - name: Confirm tracked source is unchanged
+        run: git diff --exit-code
+
+      - name: Record final disk and cache usage
+        if: always()
+        run: |
+          df -h .
+          for directory in "${FLUTTER_ROOT:-}" "${PUB_CACHE:-}" build; do
+            if [[ -n "$directory" && -d "$directory" ]]; then
+              du -sh "$directory"
+            fi
+          done
