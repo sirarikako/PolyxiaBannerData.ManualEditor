@@ -1,0 +1,1464 @@
+name: 02 - On-demand builds
+
+# Contract:
+# - Only workflow_dispatch and workflow_call entry points exist.
+# - platform is android, windows, or both; source_ref is a branch, tag, or full SHA.
+# - One resolver job validates both inputs and pins the source to one 40-character SHA.
+# - Android and Windows run as independent jobs, check out only that SHA, and verify HEAD.
+# - Inputs are passed through env/action inputs, never interpolated into shell code.
+# - No release writes, no secrets, no signing keys, no AI agents.
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Platform to build'
+        required: true
+        type: choice
+        default: android
+        options:
+          - android
+          - windows
+          - both
+      source_ref:
+        description: 'Branch, tag, or full 40-character commit SHA'
+        required: true
+        type: string
+        default: main
+  workflow_call:
+    inputs:
+      platform:
+        description: 'Platform to build: android, windows, or both'
+        required: true
+        type: string
+      source_ref:
+        description: 'Branch, tag, or full 40-character commit SHA'
+        required: true
+        type: string
+    outputs:
+      source_sha:
+        description: 'Immutable 40-character commit SHA that was built'
+        value: ${{ jobs.resolve.outputs.source_sha }}
+      android_artifact:
+        description: 'Android APK artifact name; empty when Android was not selected'
+        value: ${{ jobs.android.outputs.artifact_name }}
+      windows_artifact:
+        description: 'Windows Release ZIP artifact name; empty when Windows was not selected'
+        value: ${{ jobs.windows.outputs.artifact_name }}
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      platform: ${{ steps.resolve.outputs.platform }}
+    steps:
+      - name: Check out repository metadata
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve source ref to an immutable commit SHA
+        id: resolve
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PLATFORM_INPUT: ${{ inputs.platform }}
+          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Get-GitOutput {
+              param([string[]]$ArgumentList)
+              $output = & git @ArgumentList
+              $exitCode = $LASTEXITCODE
+              if ($exitCode -ne 0) {
+                  throw "git $($ArgumentList -join ' ') failed with exit code $exitCode"
+              }
+              return (($output | ForEach-Object { "$_" }) -join "`n").Trim()
+          }
+
+          function Test-CommitRef {
+              param([string]$RefName)
+              $output = & git rev-parse --verify --quiet "$RefName^{commit}" 2>$null
+              $exitCode = $LASTEXITCODE
+              if ($exitCode -ne 0) { return $null }
+              $value = (($output | ForEach-Object { "$_" }) -join '').Trim()
+              if ($value -notmatch '^[0-9a-f]{40}$') { return $null }
+              return $value
+          }
+
+          $platform = $env:PLATFORM_INPUT
+          if (@('android', 'windows', 'both') -cnotcontains $platform) {
+              throw "Invalid platform '$platform'. Expected one of: android, windows, both."
+          }
+
+          $sourceRef = $env:SOURCE_REF_INPUT
+          if ([string]::IsNullOrWhiteSpace($sourceRef)) {
+              if ($env:EVENT_NAME -eq 'workflow_dispatch') {
+                  $sourceRef = 'main'
+              } else {
+                  throw 'source_ref is required.'
+              }
+          }
+          if ($sourceRef -ne $sourceRef.Trim()) {
+              throw 'source_ref must not contain leading or trailing whitespace.'
+          }
+          if ($sourceRef.Length -gt 200) {
+              throw 'source_ref is too long.'
+          }
+
+          $sha = $null
+          if ($sourceRef -match '^[0-9a-fA-F]{40}$') {
+              $sha = Get-GitOutput @('rev-parse', '--verify', "$($sourceRef.ToLowerInvariant())^{commit}")
+          } else {
+              if ($sourceRef -notmatch '^[A-Za-z0-9][A-Za-z0-9._/+@-]*$') {
+                  throw "Invalid source_ref '$sourceRef'. Use a branch name, tag name, or full 40-character commit SHA."
+              }
+              if ($sourceRef.Contains('..') -or $sourceRef.Contains('@{') -or
+                  $sourceRef.Contains('//') -or $sourceRef.EndsWith('/') -or
+                  $sourceRef.EndsWith('.') -or $sourceRef.EndsWith('.lock')) {
+                  throw "Invalid source_ref '$sourceRef'."
+              }
+
+              $kind = 'auto'
+              $name = $sourceRef
+              if ($sourceRef.StartsWith('refs/heads/')) {
+                  $kind = 'branch'
+                  $name = $sourceRef.Substring('refs/heads/'.Length)
+              } elseif ($sourceRef.StartsWith('refs/tags/')) {
+                  $kind = 'tag'
+                  $name = $sourceRef.Substring('refs/tags/'.Length)
+              }
+
+              if ([string]::IsNullOrWhiteSpace($name) -or
+                  $name -notmatch '^[A-Za-z0-9][A-Za-z0-9._/+@-]*$' -or
+                  $name.Contains('..') -or $name.Contains('@{') -or
+                  $name.Contains('//') -or $name.EndsWith('/') -or
+                  $name.EndsWith('.') -or $name.EndsWith('.lock')) {
+                  throw "Invalid source_ref '$sourceRef'."
+              }
+
+              $branchSha = $null
+              $tagSha = $null
+              if ($kind -ne 'tag') {
+                  $branchSha = Test-CommitRef "refs/remotes/origin/$name"
+                  if (-not $branchSha) {
+                      $branchSha = Test-CommitRef "refs/heads/$name"
+                  }
+              }
+              if ($kind -ne 'branch') {
+                  $tagSha = Test-CommitRef "refs/tags/$name"
+              }
+
+              $found = @()
+              if ($branchSha) { $found += [pscustomobject]@{ Kind = 'branch'; Sha = $branchSha } }
+              if ($tagSha) { $found += [pscustomobject]@{ Kind = 'tag'; Sha = $tagSha } }
+              if ($found.Count -eq 0) {
+                  throw "source_ref '$sourceRef' was not found as a branch or tag in this repository."
+              }
+              if ($found.Count -gt 1) {
+                  throw "source_ref '$sourceRef' is ambiguous (both a branch and a tag). Use refs/heads/..., refs/tags/..., or a full commit SHA."
+              }
+              $sha = $found[0].Sha
+          }
+
+          if ($sha -notmatch '^[0-9a-f]{40}$') {
+              throw "Resolved source is not a full 40-character commit SHA: '$sha'."
+          }
+          $objectType = Get-GitOutput @('cat-file', '-t', $sha)
+          if ($objectType -ne 'commit') {
+              throw "Resolved source '$sha' is a '$objectType', not a commit."
+          }
+
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "source_sha=$sha"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "platform=$platform"
+
+          $summary = @(
+              '### Resolved build source',
+              '',
+              "- Platform: $platform",
+              "- Source ref: $sourceRef",
+              "- Immutable commit SHA: $sha"
+          ) -join "`n"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value $summary
+
+  android:
+    name: Android APK
+    needs: resolve
+    if: ${{ needs.resolve.outputs.platform == 'android' || needs.resolve.outputs.platform == 'both' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      artifact_name: ${{ steps.meta.outputs.artifact_name }}
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out the resolved commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify checked-out commit and set artifact identity
+        id: meta
+        env:
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headOutput = & git rev-parse HEAD
+          $headExit = $LASTEXITCODE
+          if ($headExit -ne 0) { throw "git rev-parse HEAD failed with exit code $headExit" }
+          $head = (($headOutput | ForEach-Object { "$_" }) -join '').Trim()
+          if ($head -ne $env:SOURCE_SHA) {
+              throw "Checked-out HEAD $head does not match resolved source $($env:SOURCE_SHA)."
+          }
+          $artifactName = "android-apk-$($env:SOURCE_SHA)-run$($env:RUN_ID)-attempt$($env:RUN_ATTEMPT)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "artifact_name=$artifactName"
+          $summary = @"
+          ### Android build source
+          - Commit: $head
+          - Artifact: $artifactName
+
+          **Test signing:** this workflow produces a debug-signed test APK only; it is not a production-signed release.
+          **Cloud build success does not mean Android device or emulator validation.**
+          "@
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value $summary
+
+      - name: Record initial disk space
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath((Get-Location).Path))
+          $drive = [System.IO.DriveInfo]::new($root)
+          $total = [math]::Round($drive.TotalSize / 1MB, 1)
+          $free = [math]::Round($drive.AvailableFreeSpace / 1MB, 1)
+          Write-Host "Initial disk: total=$total MB free=$free MB"
+          $summary = @"
+          ### Initial disk
+          - Total: $total MB
+          - Free: $free MB
+          "@
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value $summary
+
+      - name: Set up JDK 17 Temurin
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Verify JDK
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & java -version
+          if ($LASTEXITCODE -ne 0) { throw "java -version failed with exit code $LASTEXITCODE" }
+          & javac -version
+          if ($LASTEXITCODE -ne 0) { throw "javac -version failed with exit code $LASTEXITCODE" }
+
+      - name: Set up pinned Flutter SDK and caches
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          architecture: x64
+          cache: true
+          cache-key: flutter-02-sdk-${{ runner.os }}-x64-${{ hashFiles('.fvmrc') }}
+          pub-cache: true
+          pub-cache-key: flutter-02-pub-${{ runner.os }}-x64-${{ hashFiles('.fvmrc', 'pubspec.lock') }}
+
+      - name: Verify pinned Flutter and Dart versions
+        id: sdk
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Get-CheckedOutput {
+              param([string]$FilePath, [string[]]$ArgumentList)
+              $output = & $FilePath @ArgumentList
+              $exitCode = $LASTEXITCODE
+              if ($exitCode -ne 0) {
+                  throw "$FilePath $($ArgumentList -join ' ') failed with exit code $exitCode"
+              }
+              return (($output | ForEach-Object { "$_" }) -join "`n").Trim()
+          }
+
+          $config = Get-Content -LiteralPath '.fvmrc' -Raw | ConvertFrom-Json
+          $expected = [string]$config.flutter
+          if ($expected -notmatch '^\d+\.\d+\.\d+$') {
+              throw "An exact Flutter version is required in .fvmrc, found '$expected'."
+          }
+
+          & flutter --disable-analytics
+          if ($LASTEXITCODE -ne 0) { throw "flutter --disable-analytics failed with exit code $LASTEXITCODE" }
+          & dart --disable-analytics
+          if ($LASTEXITCODE -ne 0) { throw "dart --disable-analytics failed with exit code $LASTEXITCODE" }
+
+          $machine = Get-CheckedOutput 'flutter' @('--version', '--machine')
+          $info = $machine | ConvertFrom-Json
+          if ([string]$info.frameworkVersion -ne $expected) {
+              throw "Installed Flutter $($info.frameworkVersion) does not match .fvmrc ($expected)."
+          }
+          if ([string]$info.channel -ne 'stable') {
+              throw "Installed Flutter channel is '$($info.channel)', expected stable."
+          }
+
+          & flutter --version
+          if ($LASTEXITCODE -ne 0) { throw "flutter --version failed with exit code $LASTEXITCODE" }
+          & dart --version
+          if ($LASTEXITCODE -ne 0) { throw "dart --version failed with exit code $LASTEXITCODE" }
+
+          $dartVersion = [string]$info.dartSdkVersion
+          $engineRevision = [string]$info.engineRevision
+          Write-Host "Pinned Flutter: $expected stable"
+          Write-Host "Installed framework: $($info.frameworkVersion)"
+          Write-Host "Installed channel: $($info.channel)"
+          Write-Host "Dart SDK: $dartVersion"
+          Write-Host "Engine revision: $engineRevision"
+
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "flutter_version=$expected"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "dart_version=$dartVersion"
+          $summary = @"
+          ### Flutter and Dart versions
+          - Pinned by .fvmrc: $expected (stable)
+          - Installed framework: $($info.frameworkVersion)
+          - Channel: $($info.channel)
+          - Dart SDK: $dartVersion
+          - Engine revision: $engineRevision
+          "@
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value $summary
+
+      - name: Restore locked dependencies
+        id: pubget
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Invoke-TimedNative {
+              param(
+                  [string]$Label,
+                  [string]$FilePath,
+                  [string[]]$ArgumentList,
+                  [string]$OutputName
+              )
+              $watch = [System.Diagnostics.Stopwatch]::StartNew()
+              try {
+                  & $FilePath @ArgumentList
+                  $exitCode = $LASTEXITCODE
+                  if ($exitCode -ne 0) {
+                      throw "$Label failed with exit code $exitCode"
+                  }
+              } finally {
+                  $watch.Stop()
+                  $seconds = [math]::Round($watch.Elapsed.TotalSeconds, 3)
+                  Write-Host ("{0} duration: {1} seconds" -f $Label, $seconds)
+                  if ($env:GITHUB_STEP_SUMMARY) {
+                      try {
+                          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value "- $Label duration: $seconds seconds"
+                      } catch {
+                          Write-Warning "Could not write step summary: $($_.Exception.Message)"
+                      }
+                  }
+                  if ($OutputName -and $env:GITHUB_OUTPUT) {
+                      Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "$OutputName=$seconds"
+                  }
+              }
+          }
+
+          Invoke-TimedNative -Label 'flutter pub get --enforce-lockfile' -FilePath 'flutter' -ArgumentList @('pub', 'get', '--enforce-lockfile') -OutputName 'duration_seconds'
+
+      - name: Restore Gradle caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-02-${{ runner.os }}-${{ hashFiles('.fvmrc', 'pubspec.lock', 'android/**/*.gradle*', 'android/gradle.properties', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-02-${{ runner.os }}-
+
+      - name: Record pre-build disk and cache usage
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Get-DirectorySizeMB {
+              param([string]$Path)
+              if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return 0.0 }
+              $sum = (Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+              if ($null -eq $sum) { return 0.0 }
+              return [math]::Round([double]$sum / 1MB, 1)
+          }
+
+          function Get-DiskUsage {
+              param([string]$Path)
+              $root = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Path))
+              $drive = [System.IO.DriveInfo]::new($root)
+              return [pscustomobject]@{
+                  TotalMB = [math]::Round($drive.TotalSize / 1MB, 1)
+                  FreeMB = [math]::Round($drive.AvailableFreeSpace / 1MB, 1)
+              }
+          }
+
+          $pubCache = $env:PUB_CACHE
+          if ([string]::IsNullOrWhiteSpace($pubCache)) { $pubCache = Join-Path $HOME '.pub-cache' }
+          $gradleHome = $env:GRADLE_USER_HOME
+          if ([string]::IsNullOrWhiteSpace($gradleHome)) { $gradleHome = Join-Path $HOME '.gradle' }
+
+          $disk = Get-DiskUsage (Get-Location).Path
+          $flutterMB = Get-DirectorySizeMB $env:FLUTTER_ROOT
+          $pubMB = Get-DirectorySizeMB $pubCache
+          $gradleMB = Get-DirectorySizeMB $gradleHome
+          $buildMB = Get-DirectorySizeMB 'build'
+          Write-Host "Pre-build disk: total=$($disk.TotalMB) MB free=$($disk.FreeMB) MB"
+          Write-Host "Pre-build sizes: flutter_sdk=$flutterMB MB pub_cache=$pubMB MB gradle_cache=$gradleMB MB build=$buildMB MB"
+          $summary = @"
+          ### Pre-build disk and caches
+          - Disk total: $($disk.TotalMB) MB
+          - Disk free: $($disk.FreeMB) MB
+          - Flutter SDK: $flutterMB MB
+          - Pub cache: $pubMB MB
+          - Gradle cache: $gradleMB MB
+          - Build directory: $buildMB MB
+          "@
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value $summary
+
+      - name: Build release APK
+        id: build
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Invoke-TimedNative {
+              param(
+                  [string]$Label,
+                  [string]$FilePath,
+                  [string[]]$ArgumentList,
+                  [string]$OutputName
+              )
+              $watch = [System.Diagnostics.Stopwatch]::StartNew()
+              try {
+                  & $FilePath @ArgumentList
+                  $exitCode = $LASTEXITCODE
+                  if ($exitCode -ne 0) {
+                      throw "$Label failed with exit code $exitCode"
+                  }
+              } finally {
+                  $watch.Stop()
+                  $seconds = [math]::Round($watch.Elapsed.TotalSeconds, 3)
+                  Write-Host ("{0} duration: {1} seconds" -f $Label, $seconds)
+                  if ($env:GITHUB_STEP_SUMMARY) {
+                      try {
+                          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value "- $Label duration: $seconds seconds"
+                      } catch {
+                          Write-Warning "Could not write step summary: $($_.Exception.Message)"
+                      }
+                  }
+                  if ($OutputName -and $env:GITHUB_OUTPUT) {
+                      Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "$OutputName=$seconds"
+                  }
+              }
+          }
+
+          Invoke-TimedNative -Label 'flutter build apk --release --no-pub' -FilePath 'flutter' -ArgumentList @('build', 'apk', '--release', '--no-pub') -OutputName 'duration_seconds'
+
+          $apk = 'build/app/outputs/flutter-apk/app-release.apk'
+          if (-not (Test-Path -LiteralPath $apk -PathType Leaf)) {
+              throw "APK was not produced at $apk."
+          }
+          $apkItem = Get-Item -LiteralPath $apk
+          if ($apkItem.Length -le 0) {
+              throw "APK at $apk is empty."
+          }
+
+      - name: Package APK with manifest and checksum
+        env:
+          ARTIFACT_NAME: ${{ steps.meta.outputs.artifact_name }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          FLUTTER_VERSION: ${{ steps.sdk.outputs.flutter_version }}
+          DART_VERSION: ${{ steps.sdk.outputs.dart_version }}
+          PUBGET_SECONDS: ${{ steps.pubget.outputs.duration_seconds }}
+          BUILD_SECONDS: ${{ steps.build.outputs.duration_seconds }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function ConvertTo-Seconds {
+              param([string]$Value)
+              if ([string]::IsNullOrWhiteSpace($Value)) { return 0.0 }
+              return [double]::Parse($Value, [System.Globalization.CultureInfo]::InvariantCulture)
+          }
+
+          $gradleText = Get-Content -LiteralPath 'android/app/build.gradle.kts' -Raw
+          if ($gradleText -notmatch 'signingConfig\s*=\s*signingConfigs\.getByName\("debug"\)') {
+              throw 'Android release build no longer uses the template debug signing config; update the test-signing statement before uploading.'
+          }
+
+          $apkSource = 'build/app/outputs/flutter-apk/app-release.apk'
+          if (-not (Test-Path -LiteralPath $apkSource -PathType Leaf)) {
+              throw "APK was not produced at $apkSource."
+          }
+          $sourceItem = Get-Item -LiteralPath $apkSource
+          if ($sourceItem.Length -le 0) { throw "APK at $apkSource is empty." }
+
+          $pubspec = Get-Content -LiteralPath 'pubspec.yaml' -Raw
+          $versionMatch = [regex]::Match($pubspec, '(?m)^version:\s*(\S+)\s*$')
+          $appVersion = if ($versionMatch.Success) { $versionMatch.Groups[1].Value } else { 'unknown' }
+
+          $outDir = 'artifacts/android'
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          $apkName = "polyxia-banner-data-manual-editor-android-$($env:SOURCE_SHA)-run$($env:GITHUB_RUN_ID)-attempt$($env:GITHUB_RUN_ATTEMPT).apk"
+          $apkPath = Join-Path $outDir $apkName
+          Copy-Item -LiteralPath $apkSource -Destination $apkPath -Force
+
+          $size = (Get-Item -LiteralPath $apkPath).Length
+          if ($size -le 0) { throw "Packaged APK is empty." }
+          $hash = (Get-FileHash -LiteralPath $apkPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $sourceHash = (Get-FileHash -LiteralPath $apkSource -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sourceItem.Length -ne $size -or $sourceHash -ne $hash) {
+              throw "Packaged APK does not match the built APK in size or SHA256."
+          }
+
+          $manifest = [ordered]@{
+              schema_version = 1
+              repository = $env:GITHUB_REPOSITORY
+              workflow = $env:GITHUB_WORKFLOW
+              source_ref = $env:SOURCE_REF
+              source_sha = $env:SOURCE_SHA
+              platform = 'android'
+              application_version = $appVersion
+              flutter_version = $env:FLUTTER_VERSION
+              dart_version = $env:DART_VERSION
+              run_id = [string]$env:GITHUB_RUN_ID
+              run_attempt = [string]$env:GITHUB_RUN_ATTEMPT
+              runner_os = $env:RUNNER_OS
+              build_duration_seconds = ConvertTo-Seconds $env:BUILD_SECONDS
+              pub_get_duration_seconds = ConvertTo-Seconds $env:PUBGET_SECONDS
+              artifact_name = $env:ARTIFACT_NAME
+              signing = 'Debug-signed test APK using the Android template debug keystore; not production signed.'
+              final_artifact = [ordered]@{
+                  file = $apkName
+                  size_bytes = [long]$size
+                  sha256 = $hash
+              }
+              generated_at_utc = [DateTime]::UtcNow.ToString('o')
+          }
+
+          $manifestPath = Join-Path $outDir 'build-manifest.json'
+          $checksumPath = Join-Path $outDir "$apkName.sha256"
+          $utf8 = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText($manifestPath, (($manifest | ConvertTo-Json -Depth 10) + "`n"), $utf8)
+          [System.IO.File]::WriteAllText($checksumPath, "$hash  $apkName`n", $utf8)
+
+          foreach ($file in @($apkPath, $manifestPath, $checksumPath)) {
+              if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Expected artifact file is missing: $file" }
+              if ((Get-Item -LiteralPath $file).Length -le 0) { throw "Expected artifact file is empty: $file" }
+          }
+          $checksumText = (Get-Content -LiteralPath $checksumPath -Raw).Trim()
+          if ($checksumText -ne "$hash  $apkName") { throw "SHA256 checksum file content is invalid." }
+
+          Write-Host "APK artifact: $apkName"
+          Write-Host "APK size: $size bytes"
+          Write-Host "APK SHA256: $hash"
+          $summary = @"
+          ### Android APK artifact
+          - Artifact: $($env:ARTIFACT_NAME)
+          - File: $apkName
+          - Size: $size bytes
+          - SHA256: $hash
+          - Build duration: $(ConvertTo-Seconds $env:BUILD_SECONDS) seconds
+
+          **Test signing:** debug-signed test APK using the Android template debug keystore; not production signed.
+          **Cloud build success does not mean Android device or emulator validation.**
+          "@
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value $summary
+
+      - name: Upload Android APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.artifact_name }}
+          path: artifacts/android
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Record final disk and cache usage
+        if: always()
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try {
+              function Get-DirectorySizeMB {
+                  param([string]$Path)
+                  if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return 0.0 }
+                  $sum = (Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+                  if ($null -eq $sum) { return 0.0 }
+                  return [math]::Round([double]$sum / 1MB, 1)
+              }
+              $root = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath((Get-Location).Path))
+              $drive = [System.IO.DriveInfo]::new($root)
+              $total = [math]::Round($drive.TotalSize / 1MB, 1)
+              $free = [math]::Round($drive.AvailableFreeSpace / 1MB, 1)
+              $pubCache = $env:PUB_CACHE
+              if ([string]::IsNullOrWhiteSpace($pubCache)) { $pubCache = Join-Path $HOME '.pub-cache' }
+              $gradleHome = $env:GRADLE_USER_HOME
+              if ([string]::IsNullOrWhiteSpace($gradleHome)) { $gradleHome = Join-Path $HOME '.gradle' }
+              $flutterMB = Get-DirectorySizeMB $env:FLUTTER_ROOT
+              $pubMB = Get-DirectorySizeMB $pubCache
+              $gradleMB = Get-DirectorySizeMB $gradleHome
+              $buildMB = Get-DirectorySizeMB 'build'
+              Write-Host "Final disk: total=$total MB free=$free MB"
+              Write-Host "Final sizes: flutter_sdk=$flutterMB MB pub_cache=$pubMB MB gradle_cache=$gradleMB MB build=$buildMB MB"
+          $summary = @"
+          ### Final disk and caches
+          - Disk total: $total MB
+          - Disk free: $free MB
+          - Flutter SDK: $flutterMB MB
+          - Pub cache: $pubMB MB
+          - Gradle cache: $gradleMB MB
+          - Build directory: $buildMB MB
+          "@
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value $summary
+          } catch {
+              Write-Warning "Final disk/cache recording failed: $($_.Exception.Message)"
+          }
+
+  windows:
+    name: Windows Release ZIP
+    needs: resolve
+    if: ${{ needs.resolve.outputs.platform == 'windows' || needs.resolve.outputs.platform == 'both' }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    outputs:
+      artifact_name: ${{ steps.meta.outputs.artifact_name }}
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out the resolved commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify checked-out commit and set artifact identity
+        id: meta
+        env:
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headOutput = & git rev-parse HEAD
+          $headExit = $LASTEXITCODE
+          if ($headExit -ne 0) { throw "git rev-parse HEAD failed with exit code $headExit" }
+          $head = (($headOutput | ForEach-Object { "$_" }) -join '').Trim()
+          if ($head -ne $env:SOURCE_SHA) {
+              throw "Checked-out HEAD $head does not match resolved source $($env:SOURCE_SHA)."
+          }
+          $artifactName = "windows-release-zip-$($env:SOURCE_SHA)-run$($env:RUN_ID)-attempt$($env:RUN_ATTEMPT)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "artifact_name=$artifactName"
+          $summary = @"
+          ### Windows build source
+          - Commit: $head
+          - Artifact: $artifactName
+          "@
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value $summary
+
+      - name: Record initial disk space
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath((Get-Location).Path))
+          $drive = [System.IO.DriveInfo]::new($root)
+          $total = [math]::Round($drive.TotalSize / 1MB, 1)
+          $free = [math]::Round($drive.AvailableFreeSpace / 1MB, 1)
+          Write-Host "Initial disk: total=$total MB free=$free MB"
+          $summary = @"
+          ### Initial disk
+          - Total: $total MB
+          - Free: $free MB
+          "@
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value $summary
+
+      - name: Set up pinned Flutter SDK and caches
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          architecture: x64
+          cache: true
+          cache-key: flutter-02-sdk-${{ runner.os }}-x64-${{ hashFiles('.fvmrc') }}
+          pub-cache: true
+          pub-cache-key: flutter-02-pub-${{ runner.os }}-x64-${{ hashFiles('.fvmrc', 'pubspec.lock') }}
+
+      - name: Verify pinned Flutter and Dart versions
+        id: sdk
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Get-CheckedOutput {
+              param([string]$FilePath, [string[]]$ArgumentList)
+              $output = & $FilePath @ArgumentList
+              $exitCode = $LASTEXITCODE
+              if ($exitCode -ne 0) {
+                  throw "$FilePath $($ArgumentList -join ' ') failed with exit code $exitCode"
+              }
+              return (($output | ForEach-Object { "$_" }) -join "`n").Trim()
+          }
+
+          $config = Get-Content -LiteralPath '.fvmrc' -Raw | ConvertFrom-Json
+          $expected = [string]$config.flutter
+          if ($expected -notmatch '^\d+\.\d+\.\d+$') {
+              throw "An exact Flutter version is required in .fvmrc, found '$expected'."
+          }
+
+          & flutter --disable-analytics
+          if ($LASTEXITCODE -ne 0) { throw "flutter --disable-analytics failed with exit code $LASTEXITCODE" }
+          & dart --disable-analytics
+          if ($LASTEXITCODE -ne 0) { throw "dart --disable-analytics failed with exit code $LASTEXITCODE" }
+
+          $machine = Get-CheckedOutput 'flutter' @('--version', '--machine')
+          $info = $machine | ConvertFrom-Json
+          if ([string]$info.frameworkVersion -ne $expected) {
+              throw "Installed Flutter $($info.frameworkVersion) does not match .fvmrc ($expected)."
+          }
+          if ([string]$info.channel -ne 'stable') {
+              throw "Installed Flutter channel is '$($info.channel)', expected stable."
+          }
+
+          & flutter --version
+          if ($LASTEXITCODE -ne 0) { throw "flutter --version failed with exit code $LASTEXITCODE" }
+          & dart --version
+          if ($LASTEXITCODE -ne 0) { throw "dart --version failed with exit code $LASTEXITCODE" }
+
+          $dartVersion = [string]$info.dartSdkVersion
+          $engineRevision = [string]$info.engineRevision
+          Write-Host "Pinned Flutter: $expected stable"
+          Write-Host "Installed framework: $($info.frameworkVersion)"
+          Write-Host "Installed channel: $($info.channel)"
+          Write-Host "Dart SDK: $dartVersion"
+          Write-Host "Engine revision: $engineRevision"
+
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "flutter_version=$expected"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "dart_version=$dartVersion"
+          $summary = @"
+          ### Flutter and Dart versions
+          - Pinned by .fvmrc: $expected (stable)
+          - Installed framework: $($info.frameworkVersion)
+          - Channel: $($info.channel)
+          - Dart SDK: $dartVersion
+          - Engine revision: $engineRevision
+          "@
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value $summary
+
+      - name: Restore locked dependencies
+        id: pubget
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Invoke-TimedNative {
+              param(
+                  [string]$Label,
+                  [string]$FilePath,
+                  [string[]]$ArgumentList,
+                  [string]$OutputName
+              )
+              $watch = [System.Diagnostics.Stopwatch]::StartNew()
+              try {
+                  & $FilePath @ArgumentList
+                  $exitCode = $LASTEXITCODE
+                  if ($exitCode -ne 0) {
+                      throw "$Label failed with exit code $exitCode"
+                  }
+              } finally {
+                  $watch.Stop()
+                  $seconds = [math]::Round($watch.Elapsed.TotalSeconds, 3)
+                  Write-Host ("{0} duration: {1} seconds" -f $Label, $seconds)
+                  if ($env:GITHUB_STEP_SUMMARY) {
+                      try {
+                          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value "- $Label duration: $seconds seconds"
+                      } catch {
+                          Write-Warning "Could not write step summary: $($_.Exception.Message)"
+                      }
+                  }
+                  if ($OutputName -and $env:GITHUB_OUTPUT) {
+                      Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "$OutputName=$seconds"
+                  }
+              }
+          }
+
+          Invoke-TimedNative -Label 'flutter pub get --enforce-lockfile' -FilePath 'flutter' -ArgumentList @('pub', 'get', '--enforce-lockfile') -OutputName 'duration_seconds'
+
+      - name: Record pre-build disk and cache usage
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Get-DirectorySizeMB {
+              param([string]$Path)
+              if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return 0.0 }
+              $sum = (Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+              if ($null -eq $sum) { return 0.0 }
+              return [math]::Round([double]$sum / 1MB, 1)
+          }
+
+          function Get-DiskUsage {
+              param([string]$Path)
+              $root = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Path))
+              $drive = [System.IO.DriveInfo]::new($root)
+              return [pscustomobject]@{
+                  TotalMB = [math]::Round($drive.TotalSize / 1MB, 1)
+                  FreeMB = [math]::Round($drive.AvailableFreeSpace / 1MB, 1)
+              }
+          }
+
+          $pubCache = $env:PUB_CACHE
+          if ([string]::IsNullOrWhiteSpace($pubCache)) { $pubCache = Join-Path $HOME '.pub-cache' }
+          $disk = Get-DiskUsage (Get-Location).Path
+          $flutterMB = Get-DirectorySizeMB $env:FLUTTER_ROOT
+          $pubMB = Get-DirectorySizeMB $pubCache
+          $buildMB = Get-DirectorySizeMB 'build'
+          Write-Host "Pre-build disk: total=$($disk.TotalMB) MB free=$($disk.FreeMB) MB"
+          Write-Host "Pre-build sizes: flutter_sdk=$flutterMB MB pub_cache=$pubMB MB build=$buildMB MB"
+          $summary = @"
+          ### Pre-build disk and caches
+          - Disk total: $($disk.TotalMB) MB
+          - Disk free: $($disk.FreeMB) MB
+          - Flutter SDK: $flutterMB MB
+          - Pub cache: $pubMB MB
+          - Build directory: $buildMB MB
+          "@
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value $summary
+
+      - name: Build Windows release
+        id: build
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Invoke-TimedNative {
+              param(
+                  [string]$Label,
+                  [string]$FilePath,
+                  [string[]]$ArgumentList,
+                  [string]$OutputName
+              )
+              $watch = [System.Diagnostics.Stopwatch]::StartNew()
+              try {
+                  & $FilePath @ArgumentList
+                  $exitCode = $LASTEXITCODE
+                  if ($exitCode -ne 0) {
+                      throw "$Label failed with exit code $exitCode"
+                  }
+              } finally {
+                  $watch.Stop()
+                  $seconds = [math]::Round($watch.Elapsed.TotalSeconds, 3)
+                  Write-Host ("{0} duration: {1} seconds" -f $Label, $seconds)
+                  if ($env:GITHUB_STEP_SUMMARY) {
+                      try {
+                          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value "- $Label duration: $seconds seconds"
+                      } catch {
+                          Write-Warning "Could not write step summary: $($_.Exception.Message)"
+                      }
+                  }
+                  if ($OutputName -and $env:GITHUB_OUTPUT) {
+                      Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "$OutputName=$seconds"
+                  }
+              }
+          }
+
+          Invoke-TimedNative -Label 'flutter build windows --release --no-pub' -FilePath 'flutter' -ArgumentList @('build', 'windows', '--release', '--no-pub') -OutputName 'duration_seconds'
+
+          $release = 'build/windows/x64/runner/Release'
+          if (-not (Test-Path -LiteralPath $release -PathType Container)) {
+              throw "Windows Release directory was not produced at $release."
+          }
+
+      - name: Bundle official x64 VC++ runtime into Windows Release
+        id: vcruntime
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Get-LowerSha256 {
+              param([string]$Path)
+              return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+
+          function Test-PeMachineX64 {
+              param([string]$Path)
+              $stream = [System.IO.File]::OpenRead($Path)
+              $reader = [System.IO.BinaryReader]::new($stream)
+              try {
+                  if ($stream.Length -lt 64) { throw "PE file is too small: $Path" }
+                  $stream.Position = 0x3C
+                  $peOffset = $reader.ReadInt32()
+                  if ($peOffset -lt 64 -or ($peOffset + 6) -gt $stream.Length) {
+                      throw "PE header offset is invalid: $Path"
+                  }
+                  $stream.Position = $peOffset
+                  $signature = [byte[]]::new(4)
+                  if ($stream.Read($signature, 0, 4) -ne 4) { throw "Could not read PE signature: $Path" }
+                  if ($signature[0] -ne 0x50 -or $signature[1] -ne 0x45 -or $signature[2] -ne 0 -or $signature[3] -ne 0) {
+                      throw "File is not a PE image: $Path"
+                  }
+                  $machineBytes = [byte[]]::new(2)
+                  if ($stream.Read($machineBytes, 0, 2) -ne 2) { throw "Could not read PE machine type: $Path" }
+                  $machine = [System.BitConverter]::ToUInt16($machineBytes, 0)
+                  if ($machine -ne 0x8664) {
+                      throw ("VC++ runtime DLL is not x64 (PE machine 0x{0:X4}): {1}" -f $machine, $Path)
+                  }
+              } finally {
+                  $stream.Dispose()
+              }
+          }
+
+          $vswhereCandidates = @()
+          if (-not [string]::IsNullOrWhiteSpace(${env:ProgramFiles(x86)})) {
+              $vswhereCandidates += Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+              $vswhereCandidates += Join-Path $env:ProgramFiles 'Microsoft Visual Studio\Installer\vswhere.exe'
+          }
+          $vswherePath = @($vswhereCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1)
+          if ($vswherePath.Count -eq 0) {
+              throw 'vswhere.exe was not found in the standard Visual Studio Installer locations; cannot locate an official VC++ redistributable source.'
+          }
+          $vswherePath = [string]$vswherePath[0]
+
+          $vsPathOutput = & $vswherePath -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+          $vswhereExit = $LASTEXITCODE
+          if ($vswhereExit -ne 0) {
+              throw "vswhere failed with exit code $vswhereExit while locating Visual Studio."
+          }
+          $vsPaths = @($vsPathOutput | ForEach-Object { "$_".Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          if ($vsPaths.Count -eq 0) {
+              throw 'vswhere reported no Visual Studio installation with the x64 C++ tools; cannot locate an official VC++ redistributable source.'
+          }
+          $vsPath = $vsPaths[0]
+          if (-not (Test-Path -LiteralPath $vsPath -PathType Container)) {
+              throw "vswhere reported a Visual Studio installation that does not exist: $vsPath"
+          }
+
+          $redistRoot = Join-Path $vsPath 'VC\Redist\MSVC'
+          if (-not (Test-Path -LiteralPath $redistRoot -PathType Container)) {
+              throw "The official VC++ redistributable directory was not found under the installed Visual Studio: $redistRoot"
+          }
+          $versionDirs = @(Get-ChildItem -LiteralPath $redistRoot -Directory |
+              Where-Object { $_.Name -match '^14\.\d+(\.\d+){0,2}$' } |
+              Sort-Object { [version]$_.Name } -Descending)
+          if ($versionDirs.Count -eq 0) {
+              throw "No Microsoft.VC14* redistributable version directory was found under: $redistRoot"
+          }
+
+          $requiredRuntimeDlls = @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
+          $selected = $null
+          $rejected = [System.Collections.Generic.List[string]]::new()
+          foreach ($versionDir in $versionDirs) {
+              $x64Dir = Join-Path $versionDir.FullName 'x64'
+              if (-not (Test-Path -LiteralPath $x64Dir -PathType Container)) { continue }
+              $crtDirs = @(Get-ChildItem -LiteralPath $x64Dir -Directory |
+                  Where-Object { $_.Name -match '^Microsoft\.VC14\d*\.CRT$' } |
+                  Sort-Object Name -Descending)
+              foreach ($crtDir in $crtDirs) {
+                  $candidateOk = $true
+                  foreach ($name in $requiredRuntimeDlls) {
+                      $candidatePath = Join-Path $crtDir.FullName $name
+                      if (-not (Test-Path -LiteralPath $candidatePath -PathType Leaf) -or
+                          (Get-Item -LiteralPath $candidatePath).Length -le 0) {
+                          $candidateOk = $false
+                          break
+                      }
+                  }
+                  if ($candidateOk) {
+                      $selected = [pscustomobject]@{
+                          Version = $versionDir.Name
+                          CrtName = $crtDir.Name
+                          CrtPath = $crtDir.FullName
+                      }
+                      break
+                  }
+                  $rejected.Add("$($versionDir.Name)/x64/$($crtDir.Name) (missing or empty required DLL)")
+              }
+              if ($selected) { break }
+          }
+          if (-not $selected) {
+              $detail = if ($rejected.Count -gt 0) { ' Rejected candidates: ' + ($rejected -join '; ') } else { ' No Microsoft.VC14*.CRT directory matched under x64.' }
+              throw "No usable official x64 VC++ redistributable CRT directory was found under $redistRoot.$detail"
+          }
+
+          $release = 'build/windows/x64/runner/Release'
+          if (-not (Test-Path -LiteralPath $release -PathType Container)) {
+              throw "Windows Release directory is missing before VC++ runtime bundling: $release"
+          }
+          $releaseFull = (Resolve-Path -LiteralPath $release).Path
+
+          $sourceDlls = @(Get-ChildItem -LiteralPath $selected.CrtPath -File |
+              Where-Object { $_.Extension -ieq '.dll' } |
+              Sort-Object Name)
+          if ($sourceDlls.Count -eq 0) {
+              throw "The selected official CRT directory contains no DLLs: $($selected.CrtPath)"
+          }
+
+          $copied = @()
+          foreach ($dll in $sourceDlls) {
+              if ($dll.Length -le 0) { throw "Official VC++ runtime file is empty: $($dll.FullName)" }
+              if ($dll.Name -match '(?i)d\.dll$') {
+                  throw "Refusing to copy a debug CRT DLL from the release redistributable directory: $($dll.FullName)"
+              }
+              Test-PeMachineX64 $dll.FullName
+              $destination = Join-Path $releaseFull $dll.Name
+              Copy-Item -LiteralPath $dll.FullName -Destination $destination -Force
+              $destinationItem = Get-Item -LiteralPath $destination
+              if ($destinationItem.Length -ne $dll.Length) {
+                  throw "Copied VC++ runtime file has the wrong size: $destination"
+              }
+              $sourceHash = Get-LowerSha256 $dll.FullName
+              $destinationHash = Get-LowerSha256 $destination
+              if ($sourceHash -ne $destinationHash) {
+                  throw "Copied VC++ runtime file does not match its source SHA256: $destination"
+              }
+              $copied += [ordered]@{
+                  name = $dll.Name
+                  size_bytes = [long]$destinationItem.Length
+                  sha256 = $destinationHash
+              }
+          }
+
+          foreach ($name in $requiredRuntimeDlls) {
+              $destination = Join-Path $releaseFull $name
+              if (-not (Test-Path -LiteralPath $destination -PathType Leaf)) {
+                  throw "Required VC++ runtime DLL is missing before packaging: $name"
+              }
+              if ((Get-Item -LiteralPath $destination).Length -le 0) {
+                  throw "Required VC++ runtime DLL is empty before packaging: $name"
+              }
+              if (@($copied | Where-Object { $_.name -ieq $name }).Count -ne 1) {
+                  throw "Required VC++ runtime DLL was not recorded in the copied file list: $name"
+              }
+          }
+
+          $copiedJson = ConvertTo-Json -InputObject @($copied) -Compress
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "source=$($selected.CrtPath)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "visual_studio=$vsPath"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "version=$($selected.Version)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "crt_name=$($selected.CrtName)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "copied_files_json=$copiedJson"
+
+          Write-Host "VC++ runtime source: $($selected.CrtPath)"
+          Write-Host "Visual Studio installation: $vsPath"
+          Write-Host "VC++ runtime version: $($selected.Version) ($($selected.CrtName), x64)"
+          foreach ($file in $copied) {
+              Write-Host "VC++ runtime file: $($file.name) ($($file.size_bytes) bytes, SHA256 $($file.sha256))"
+          }
+          $summary = @"
+          ### Windows VC++ runtime
+          - Source: $($selected.CrtPath)
+          - Visual Studio: $vsPath
+          - Redistributable version: $($selected.Version) ($($selected.CrtName), x64)
+          - Copied files: $($copied.Count)
+          - Required files: $($requiredRuntimeDlls -join ', ')
+          - Provenance: installed Visual Studio VC\Redist\MSVC release CRT; no downloads and no system-directory copies.
+          "@
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value $summary
+
+      - name: Package and verify Windows Release ZIP
+        env:
+          ARTIFACT_NAME: ${{ steps.meta.outputs.artifact_name }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          FLUTTER_VERSION: ${{ steps.sdk.outputs.flutter_version }}
+          DART_VERSION: ${{ steps.sdk.outputs.dart_version }}
+          PUBGET_SECONDS: ${{ steps.pubget.outputs.duration_seconds }}
+          BUILD_SECONDS: ${{ steps.build.outputs.duration_seconds }}
+          VC_RUNTIME_SOURCE: ${{ steps.vcruntime.outputs.source }}
+          VC_RUNTIME_VS: ${{ steps.vcruntime.outputs.visual_studio }}
+          VC_RUNTIME_VERSION: ${{ steps.vcruntime.outputs.version }}
+          VC_RUNTIME_CRT: ${{ steps.vcruntime.outputs.crt_name }}
+          VC_RUNTIME_FILES: ${{ steps.vcruntime.outputs.copied_files_json }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.IO.Compression
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          function ConvertTo-Seconds {
+              param([string]$Value)
+              if ([string]::IsNullOrWhiteSpace($Value)) { return 0.0 }
+              return [double]::Parse($Value, [System.Globalization.CultureInfo]::InvariantCulture)
+          }
+
+          function Get-StreamSha256 {
+              param([System.IO.Stream]$Stream)
+              $sha = [System.Security.Cryptography.SHA256]::Create()
+              try {
+                  $bytes = $sha.ComputeHash($Stream)
+                  return ([System.BitConverter]::ToString($bytes)).Replace('-', '').ToLowerInvariant()
+              } finally {
+                  $sha.Dispose()
+              }
+          }
+
+          $release = 'build/windows/x64/runner/Release'
+          if (-not (Test-Path -LiteralPath $release -PathType Container)) {
+              throw "Windows Release directory is missing: $release"
+          }
+          $releaseFull = (Resolve-Path -LiteralPath $release).Path
+
+          $cmakeText = Get-Content -LiteralPath 'windows/CMakeLists.txt' -Raw
+          $binaryMatch = [regex]::Match($cmakeText, 'set\s*\(\s*BINARY_NAME\s+"([^"]+)"\s*\)')
+          if (-not $binaryMatch.Success) { throw 'Could not read BINARY_NAME from windows/CMakeLists.txt.' }
+          $exeName = $binaryMatch.Groups[1].Value + '.exe'
+
+          $files = @(Get-ChildItem -LiteralPath $releaseFull -Recurse -File -Force | Sort-Object FullName)
+          if ($files.Count -eq 0) { throw "Windows Release directory contains no files." }
+
+          $entries = @()
+          $sourceByPath = @{}
+          foreach ($file in $files) {
+              $rel = [System.IO.Path]::GetRelativePath($releaseFull, $file.FullName).Replace('\', '/')
+              if ($rel.StartsWith('/') -or $rel -match '^[A-Za-z]:' -or $rel -match '(^|/)\.\.(/|$)') {
+                  throw "Unsafe relative path in Release directory: $rel"
+              }
+              if ($file.Length -le 0) { throw "Release file is empty: $rel" }
+              $fileHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              $entries += [ordered]@{
+                  path = $rel
+                  size_bytes = [long]$file.Length
+                  sha256 = $fileHash
+              }
+              $sourceByPath[$rel] = $file.FullName
+          }
+
+          $paths = @($entries | ForEach-Object { $_.path })
+          $requiredRuntimeDlls = @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
+          $requiredReleaseFiles = @($exeName, 'flutter_windows.dll', 'data/icudtl.dat', 'data/app.so') + $requiredRuntimeDlls
+          foreach ($required in $requiredReleaseFiles) {
+              if ($paths -notcontains $required) {
+                  throw "Required Windows Release file is missing: $required"
+              }
+          }
+          foreach ($runtimeDll in $requiredRuntimeDlls) {
+              $runtimeSource = Join-Path $releaseFull $runtimeDll
+              if (-not (Test-Path -LiteralPath $runtimeSource -PathType Leaf)) {
+                  throw "Required VC++ runtime DLL is missing before packaging: $runtimeDll"
+              }
+              if ((Get-Item -LiteralPath $runtimeSource).Length -le 0) {
+                  throw "Required VC++ runtime DLL is empty before packaging: $runtimeDll"
+              }
+          }
+          $assetFiles = @($paths | Where-Object { $_ -like 'data/flutter_assets/*' })
+          if ($assetFiles.Count -eq 0) {
+              throw 'Windows Release directory has no data/flutter_assets files.'
+          }
+
+          $pubspec = Get-Content -LiteralPath 'pubspec.yaml' -Raw
+          $versionMatch = [regex]::Match($pubspec, '(?m)^version:\s*(\S+)\s*$')
+          $appVersion = if ($versionMatch.Success) { $versionMatch.Groups[1].Value } else { 'unknown' }
+
+          $outDir = 'artifacts/windows'
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          $zipName = "polyxia-banner-data-manual-editor-windows-$($env:SOURCE_SHA)-run$($env:GITHUB_RUN_ID)-attempt$($env:GITHUB_RUN_ATTEMPT).zip"
+          $zipPath = Join-Path $outDir $zipName
+          if (Test-Path -LiteralPath $zipPath) { throw "Refusing to overwrite existing ZIP: $zipPath" }
+
+          $zipStream = [System.IO.File]::Open($zipPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+          try {
+              $archive = [System.IO.Compression.ZipArchive]::new($zipStream, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+              try {
+                  foreach ($entry in $entries) {
+                      $sourcePath = $sourceByPath[$entry.path]
+                      $zipEntry = $archive.CreateEntry($entry.path, [System.IO.Compression.CompressionLevel]::Optimal)
+                      $entryStream = $zipEntry.Open()
+                      try {
+                          $fileStream = [System.IO.File]::OpenRead($sourcePath)
+                          try {
+                              $fileStream.CopyTo($entryStream)
+                          } finally {
+                              $fileStream.Dispose()
+                          }
+                      } finally {
+                          $entryStream.Dispose()
+                      }
+                  }
+              } finally {
+                  $archive.Dispose()
+              }
+          } finally {
+              $zipStream.Dispose()
+          }
+
+          $zipItem = Get-Item -LiteralPath $zipPath
+          if ($zipItem.Length -le 0) { throw "Windows ZIP is empty." }
+          $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          $zipArchive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+              $zipFiles = @{}
+              foreach ($zipEntry in $zipArchive.Entries) {
+                  if ([string]::IsNullOrEmpty($zipEntry.Name)) { continue }
+                  $zipPathName = $zipEntry.FullName.Replace('\', '/')
+                  if ($zipPathName.StartsWith('/') -or $zipPathName -match '^[A-Za-z]:' -or $zipPathName -match '(^|/)\.\.(/|$)') {
+                      throw "Unsafe ZIP entry path: $zipPathName"
+                  }
+                  if ($zipFiles.ContainsKey($zipPathName)) { throw "Duplicate ZIP entry: $zipPathName" }
+                  if ($zipEntry.Length -le 0) { throw "ZIP entry is empty: $zipPathName" }
+                  $entryStream = $zipEntry.Open()
+                  try {
+                      $entryHash = Get-StreamSha256 $entryStream
+                  } finally {
+                      $entryStream.Dispose()
+                  }
+                  $zipFiles[$zipPathName] = [pscustomobject]@{
+                      size_bytes = [long]$zipEntry.Length
+                      sha256 = $entryHash
+                  }
+              }
+
+              if ($zipFiles.Count -ne $entries.Count) {
+                  throw "ZIP entry count $($zipFiles.Count) does not match Release file count $($entries.Count)."
+              }
+              foreach ($entry in $entries) {
+                  if (-not $zipFiles.ContainsKey($entry.path)) {
+                      throw "ZIP is missing Release file: $($entry.path)"
+                  }
+                  $zipped = $zipFiles[$entry.path]
+                  if ($zipped.size_bytes -ne $entry.size_bytes) {
+                      throw "ZIP size mismatch for $($entry.path)."
+                  }
+                  if ($zipped.sha256 -ne $entry.sha256) {
+                      throw "ZIP SHA256 mismatch for $($entry.path)."
+                  }
+              }
+              foreach ($runtimeDll in $requiredRuntimeDlls) {
+                  if (-not $zipFiles.ContainsKey($runtimeDll)) {
+                      throw "ZIP is missing required VC++ runtime DLL: $runtimeDll"
+                  }
+                  if ($zipFiles[$runtimeDll].size_bytes -le 0) {
+                      throw "ZIP entry for required VC++ runtime DLL is empty: $runtimeDll"
+                  }
+              }
+              $zipEntryCount = $zipFiles.Count
+          } finally {
+              $zipArchive.Dispose()
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:VC_RUNTIME_FILES) -or
+              [string]::IsNullOrWhiteSpace($env:VC_RUNTIME_SOURCE) -or
+              [string]::IsNullOrWhiteSpace($env:VC_RUNTIME_VS) -or
+              [string]::IsNullOrWhiteSpace($env:VC_RUNTIME_VERSION) -or
+              [string]::IsNullOrWhiteSpace($env:VC_RUNTIME_CRT)) {
+              throw 'VC++ runtime provenance outputs are missing; refusing to write an incomplete manifest.'
+          }
+          $runtimeFiles = @($env:VC_RUNTIME_FILES | ConvertFrom-Json)
+          foreach ($runtimeDll in $requiredRuntimeDlls) {
+              if (@($runtimeFiles | Where-Object { $_.name -ieq $runtimeDll }).Count -ne 1) {
+                  throw "VC++ runtime provenance is incomplete for $runtimeDll."
+              }
+          }
+
+          $manifest = [ordered]@{
+              schema_version = 1
+              repository = $env:GITHUB_REPOSITORY
+              workflow = $env:GITHUB_WORKFLOW
+              source_ref = $env:SOURCE_REF
+              source_sha = $env:SOURCE_SHA
+              platform = 'windows'
+              application_version = $appVersion
+              flutter_version = $env:FLUTTER_VERSION
+              dart_version = $env:DART_VERSION
+              run_id = [string]$env:GITHUB_RUN_ID
+              run_attempt = [string]$env:GITHUB_RUN_ATTEMPT
+              runner_os = $env:RUNNER_OS
+              build_duration_seconds = ConvertTo-Seconds $env:BUILD_SECONDS
+              pub_get_duration_seconds = ConvertTo-Seconds $env:PUBGET_SECONDS
+              artifact_name = $env:ARTIFACT_NAME
+              signing = 'Unsigned Windows build; no code signing configured.'
+              release_root = 'build/windows/x64/runner/Release'
+              vc_runtime = [ordered]@{
+                  source = $env:VC_RUNTIME_SOURCE
+                  visual_studio = $env:VC_RUNTIME_VS
+                  redistributable_version = $env:VC_RUNTIME_VERSION
+                  crt_directory = $env:VC_RUNTIME_CRT
+                  architecture = 'x64'
+                  required_files = $requiredRuntimeDlls
+                  files = $runtimeFiles
+                  provenance = 'Copied from the installed Visual Studio VC\Redist\MSVC x64 Microsoft.VC14*.CRT release redistributable directory; no downloads and no system-directory copies.'
+              }
+              release_file_count = $entries.Count
+              release_files = $entries
+              zip_entry_count = $zipEntryCount
+              zip_verification = 'Verified: ZIP file entries match all Release files one-to-one; every entry is non-empty with matching size and SHA256; msvcp140.dll, vcruntime140.dll, and vcruntime140_1.dll are present in release_files and the ZIP.'
+              final_artifact = [ordered]@{
+                  file = $zipName
+                  size_bytes = [long]$zipItem.Length
+                  sha256 = $zipHash
+              }
+              generated_at_utc = [DateTime]::UtcNow.ToString('o')
+          }
+
+          $manifestPath = Join-Path $outDir 'build-manifest.json'
+          $checksumPath = Join-Path $outDir "$zipName.sha256"
+          $utf8 = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText($manifestPath, (($manifest | ConvertTo-Json -Depth 20) + "`n"), $utf8)
+          [System.IO.File]::WriteAllText($checksumPath, "$zipHash  $zipName`n", $utf8)
+
+          foreach ($file in @($zipPath, $manifestPath, $checksumPath)) {
+              if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Expected artifact file is missing: $file" }
+              if ((Get-Item -LiteralPath $file).Length -le 0) { throw "Expected artifact file is empty: $file" }
+          }
+          $checksumText = (Get-Content -LiteralPath $checksumPath -Raw).Trim()
+          if ($checksumText -ne "$zipHash  $zipName") { throw "SHA256 checksum file content is invalid." }
+          $manifestCheck = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          if ($manifestCheck.release_file_count -ne $entries.Count) { throw "Manifest release file count is invalid." }
+          if (@($manifestCheck.vc_runtime.required_files).Count -ne $requiredRuntimeDlls.Count) {
+              throw "Manifest VC++ runtime required file list is invalid."
+          }
+          if (@($manifestCheck.vc_runtime.files).Count -ne $runtimeFiles.Count) {
+              throw "Manifest VC++ runtime file list is invalid."
+          }
+          foreach ($runtimeDll in $requiredRuntimeDlls) {
+              if (@($manifestCheck.release_files | Where-Object { $_.path -eq $runtimeDll }).Count -ne 1) {
+                  throw "Manifest release_files does not contain exactly one entry for $runtimeDll."
+              }
+          }
+
+          Write-Host "Windows ZIP artifact: $zipName"
+          Write-Host "Windows ZIP size: $($zipItem.Length) bytes"
+          Write-Host "Windows ZIP SHA256: $zipHash"
+          Write-Host "Release files: $($entries.Count); verified ZIP entries: $zipEntryCount"
+          Write-Host "VC++ runtime: $($env:VC_RUNTIME_VERSION) $($env:VC_RUNTIME_CRT) x64 from $($env:VC_RUNTIME_SOURCE)"
+          $summary = @"
+          ### Windows Release ZIP artifact
+          - Artifact: $($env:ARTIFACT_NAME)
+          - File: $zipName
+          - Size: $($zipItem.Length) bytes
+          - SHA256: $zipHash
+          - Release files: $($entries.Count)
+          - VC++ runtime: $($env:VC_RUNTIME_VERSION) $($env:VC_RUNTIME_CRT) x64 ($($runtimeFiles.Count) files)
+          - VC++ runtime source: $($env:VC_RUNTIME_SOURCE)
+          - Build duration: $(ConvertTo-Seconds $env:BUILD_SECONDS) seconds
+          - ZIP integrity: all Release files matched one-to-one with non-empty ZIP entries and matching SHA256, including the three required VC++ runtime DLLs.
+
+          **Unsigned build:** no Windows code signing is configured.
+          **Cloud build success does not mean Windows device validation.**
+          "@
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value $summary
+
+      - name: Upload Windows Release ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.artifact_name }}
+          path: artifacts/windows
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Record final disk and cache usage
+        if: always()
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try {
+              function Get-DirectorySizeMB {
+                  param([string]$Path)
+                  if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return 0.0 }
+                  $sum = (Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+                  if ($null -eq $sum) { return 0.0 }
+                  return [math]::Round([double]$sum / 1MB, 1)
+              }
+              $root = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath((Get-Location).Path))
+              $drive = [System.IO.DriveInfo]::new($root)
+              $total = [math]::Round($drive.TotalSize / 1MB, 1)
+              $free = [math]::Round($drive.AvailableFreeSpace / 1MB, 1)
+              $pubCache = $env:PUB_CACHE
+              if ([string]::IsNullOrWhiteSpace($pubCache)) { $pubCache = Join-Path $HOME '.pub-cache' }
+              $flutterMB = Get-DirectorySizeMB $env:FLUTTER_ROOT
+              $pubMB = Get-DirectorySizeMB $pubCache
+              $buildMB = Get-DirectorySizeMB 'build'
+              Write-Host "Final disk: total=$total MB free=$free MB"
+              Write-Host "Final sizes: flutter_sdk=$flutterMB MB pub_cache=$pubMB MB build=$buildMB MB"
+          $summary = @"
+          ### Final disk and caches
+          - Disk total: $total MB
+          - Disk free: $free MB
+          - Flutter SDK: $flutterMB MB
+          - Pub cache: $pubMB MB
+          - Build directory: $buildMB MB
+          "@
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value $summary
+          } catch {
+              Write-Warning "Final disk/cache recording failed: $($_.Exception.Message)"
+          }
+
+  summary:
+    name: Build result summary
+    needs:
+      - resolve
+      - android
+      - windows
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check selected platform results
+        shell: pwsh
+        env:
+          PLATFORM: ${{ needs.resolve.outputs.platform }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          ANDROID_RESULT: ${{ needs.android.result }}
+          WINDOWS_RESULT: ${{ needs.windows.result }}
+          ANDROID_ARTIFACT: ${{ needs.android.outputs.artifact_name }}
+          WINDOWS_ARTIFACT: ${{ needs.windows.outputs.artifact_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $errors = [System.Collections.Generic.List[string]]::new()
+          $validPlatforms = @('android', 'windows', 'both')
+          if ($validPlatforms -cnotcontains $env:PLATFORM) {
+              $errors.Add("Platform resolution failed or returned an invalid value: '$($env:PLATFORM)'.")
+          }
+
+          $selected = @()
+          if ($env:PLATFORM -ceq 'android' -or $env:PLATFORM -ceq 'both') { $selected += 'android' }
+          if ($env:PLATFORM -ceq 'windows' -or $env:PLATFORM -ceq 'both') { $selected += 'windows' }
+
+          $rows = @()
+          foreach ($platform in @('android', 'windows')) {
+              $result = if ($platform -eq 'android') { $env:ANDROID_RESULT } else { $env:WINDOWS_RESULT }
+              $artifact = if ($platform -eq 'android') { $env:ANDROID_ARTIFACT } else { $env:WINDOWS_ARTIFACT }
+              $isSelected = $selected -ccontains $platform
+              $rows += "| $platform | $isSelected | $result | $artifact |"
+              if ($isSelected) {
+                  if ($result -cne 'success') {
+                      $errors.Add("$platform was selected but its job result is '$result'.")
+                  }
+                  if ([string]::IsNullOrWhiteSpace($artifact)) {
+                      $errors.Add("$platform was selected but did not produce an artifact name.")
+                  }
+              } elseif ($validPlatforms -ccontains $env:PLATFORM) {
+                  if ($result -cne 'skipped') {
+                      $errors.Add("$platform was not selected but its job result is '$result' instead of 'skipped'.")
+                  }
+              }
+          }
+
+          $shaText = if ([string]::IsNullOrWhiteSpace($env:SOURCE_SHA)) { '(not resolved)' } else { $env:SOURCE_SHA }
+          $lines = @(
+              '### 02 build result',
+              '',
+              '| Platform | Selected | Result | Artifact |',
+              '| --- | --- | --- | --- |'
+          ) + $rows + @(
+              '',
+              "- Source SHA: $shaText",
+              '- Android artifacts are debug-signed test APKs; cloud success does not mean Android device validation.',
+              '- Windows ZIPs are unsigned; cloud success does not mean Windows device validation.'
+          )
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value ($lines -join "`n")
+
+          if ($errors.Count -gt 0) {
+              foreach ($message in $errors) { Write-Host "ERROR: $message" }
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value "`n**Result: FAILED.** $($errors -join ' ')"
+              throw ("Build summary validation failed: " + ($errors -join ' '))
+          }
+
+          Write-Host "All selected platform jobs succeeded; unselected platforms were skipped."
