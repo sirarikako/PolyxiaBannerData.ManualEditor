@@ -33,7 +33,7 @@ class _EditorHomeState extends State<EditorHome> {
   Game game = Game.genshin;
   Catalog? catalog;
   ManualDocument? document;
-  Banner? selected;
+  GachaBanner? selected;
   String? version;
   String? error;
   String poolType = 'character_event';
