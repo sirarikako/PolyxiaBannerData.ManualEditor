@@ -18,8 +18,9 @@ Map<String, dynamic> asObject(Object? x) {
 }
 
 String requiredText(Object? value, String field) {
-  if (value is! String || value.trim().isEmpty)
-    throw FormatException('${field}不能为空');
+  if (value is! String || value.trim().isEmpty) {
+    throw FormatException('$field不能为空');
+  }
   return value.trim();
 }
 
@@ -130,17 +131,9 @@ class ManualDocument {
     return doc;
   }
 
-  String get filename => game.key + '_' + version + '.json';
+  String get filename => '${game.key}_$version.json';
   String get formatted =>
-      const JsonEncoder.withIndent('  ').convert({
-        'format': game.format,
-        'game': game.key,
-        'locale': 'zh-CN',
-        'version': version,
-        'upcoming': upcoming,
-        'existing': existing,
-      }) +
-      '\n';
+      '${const JsonEncoder.withIndent('  ').convert({'format': game.format, 'game': game.key, 'locale': 'zh-CN', 'version': version, 'upcoming': upcoming, 'existing': existing})}\n';
 
   void validate() {
     requiredText(version, '版本');
@@ -148,8 +141,9 @@ class ManualDocument {
     for (final row in existing) {
       final id = requiredText(row['id'], '内部 ID');
       _checkId(id);
-      if (row.containsKey('match'))
+      if (row.containsKey('match')) {
         throw const FormatException('existing 不能包含 match');
+      }
       _checkPatch(row, {'id'});
       if (_pending(row) && !ids.add(id)) {
         throw const FormatException('重复的待处理 existing');
@@ -157,8 +151,9 @@ class ManualDocument {
     }
     final matches = <String>{};
     for (final row in upcoming) {
-      if (row.containsKey('id'))
+      if (row.containsKey('id')) {
         throw const FormatException('upcoming 不能指定内部 ID');
+      }
       final match = asObject(row['match']);
       _checkMatch(match);
       _checkPatch(row, {'match'});
@@ -206,8 +201,9 @@ class ManualDocument {
             'collab_character',
             'collab_light_cone',
           ];
-    if (!types.contains(match['poolType']))
+    if (!types.contains(match['poolType'])) {
       throw const FormatException('不支持的池类型');
+    }
     if (match.containsKey('version') &&
         requiredText(match['version'], '匹配版本') != version) {
       throw const FormatException('匹配版本与文件版本不符');
@@ -215,8 +211,9 @@ class ManualDocument {
     if (game == Game.starrail || match.containsKey('bannerName')) {
       requiredText(match['bannerName'], '卡池名称');
     }
-    if (match.containsKey('fiveStarName'))
+    if (match.containsKey('fiveStarName')) {
       requiredText(match['fiveStarName'], '五星名称');
+    }
     if (match.containsKey('postId')) {
       final post = requiredText(match['postId'], '帖子 ID');
       if (!RegExp(r'^[0-9]+$').hasMatch(post)) {
@@ -250,14 +247,17 @@ class ManualDocument {
     if (!['pending', 'completed'].contains(row['status'] ?? 'pending')) {
       throw const FormatException('status 不合法');
     }
-    if (row.containsKey('completedAt'))
+    if (row.containsKey('completedAt')) {
       requiredText(row['completedAt'], 'completedAt');
-    if (row.containsKey('appliedId'))
+    }
+    if (row.containsKey('appliedId')) {
       _checkId(requiredText(row['appliedId'], 'appliedId'));
+    }
     if (!row.containsKey('set') &&
         !row.containsKey('itemIds') &&
-        !row.containsKey('addSources'))
+        !row.containsKey('addSources')) {
       throw const FormatException('缺少修改字段');
+    }
     if (row.containsKey('set')) _checkSet(asObject(row['set']));
     if (row.containsKey('itemIds')) {
       for (final entry in asObject(row['itemIds']).entries) {
@@ -270,10 +270,12 @@ class ManualDocument {
       }
     }
     if (row.containsKey('addSources')) {
-      if (row['addSources'] is! List)
+      if (row['addSources'] is! List) {
         throw const FormatException('addSources 必须为数组');
-      for (final source in row['addSources'] as List)
+      }
+      for (final source in row['addSources'] as List) {
         _checkSource(asObject(source));
+      }
     }
   }
 
@@ -304,19 +306,23 @@ class ManualDocument {
     if (set.containsKey('images')) {
       final images = asObject(set['images']);
       _checkLocales(images);
-      for (final value in images.values) _checkUrl(value);
+      for (final value in images.values) {
+        _checkUrl(value);
+      }
     }
     if (set.containsKey('gachaTypes')) {
       final gacha = asObject(set['gachaTypes']);
       if (gacha.keys.any((key) => !{'raw', 'uigf'}.contains(key))) {
         throw const FormatException('gachaTypes 含未知键');
       }
-      if (gacha.containsKey('raw') && gacha['raw'] != null)
+      if (gacha.containsKey('raw') && gacha['raw'] != null) {
         _checkStrings(gacha['raw'], 'raw');
+      }
       if (gacha.containsKey('uigf')) _checkStrings(gacha['uigf'], 'uigf');
     }
-    if (set.containsKey('gachaIds'))
+    if (set.containsKey('gachaIds')) {
       _checkStrings(set['gachaIds'], 'gachaIds', digits: true);
+    }
     if (set.containsKey('fatePointLimit') &&
         ![null, 0, 1, 2].contains(set['fatePointLimit'])) {
       throw const FormatException('fatePointLimit 无效');
@@ -370,12 +376,14 @@ class ManualDocument {
             !servers.add(region['server'] as String)) {
           throw const FormatException('服务器无效、重复或字段异常');
         }
-        if (region.containsKey('startAt'))
+        if (region.containsKey('startAt')) {
           validateTime(requiredText(region['startAt'], '开始时间'));
+        }
         if (region.containsKey('endAt')) {
           if (region['endAt'] == null) {
-            if (game == Game.genshin)
+            if (game == Game.genshin) {
               throw const FormatException('原神结束时间不能为 null');
+            }
           } else {
             validateTime(requiredText(region['endAt'], '结束时间'));
           }
@@ -391,9 +399,12 @@ class ManualDocument {
     }
     if (set.containsKey('sources')) {
       final sources = set['sources'];
-      if (sources is! List || sources.isEmpty)
+      if (sources is! List || sources.isEmpty) {
         throw const FormatException('sources 不能为空');
-      for (final source in sources) _checkSource(asObject(source));
+      }
+      for (final source in sources) {
+        _checkSource(asObject(source));
+      }
     }
   }
 
@@ -408,12 +419,15 @@ class ManualDocument {
   void _checkNames(Map<String, dynamic> names) {
     if (names.isEmpty) throw const FormatException('名称不能为空');
     _checkLocales(names);
-    for (final text in names.values) requiredText(text, '本地化名称');
+    for (final text in names.values) {
+      requiredText(text, '本地化名称');
+    }
   }
 
   void _checkStrings(Object? value, String label, {bool digits = false}) {
-    if (value is! List || value.isEmpty)
+    if (value is! List || value.isEmpty) {
       throw FormatException('$label 必须为非空数组');
+    }
     final seen = <String>{};
     for (final entry in value) {
       final text = requiredText(entry, label);
@@ -430,8 +444,9 @@ class ManualDocument {
       throw const FormatException('来源包含额外字段');
     }
     requiredText(source['provider'], 'provider');
-    if (source.containsKey('externalId'))
+    if (source.containsKey('externalId')) {
       requiredText(source['externalId'], 'externalId');
+    }
     if (source.containsKey('url')) _checkUrl(source['url']);
   }
 
@@ -502,8 +517,11 @@ class ManualDocument {
           if (result['addSources'] is List) ...result['addSources'] as List,
         ];
         for (final source in entry.value as List) {
-          if (!sources.any((value) => jsonEncode(value) == jsonEncode(source)))
+          if (!sources.any(
+            (value) => jsonEncode(value) == jsonEncode(source),
+          )) {
             sources.add(source);
+          }
         }
         result['addSources'] = sources;
       }
@@ -636,8 +654,9 @@ class Repository {
       <int>[],
       (all, next) => all..addAll(next),
     );
-    if (res.statusCode != 200)
+    if (res.statusCode != 200) {
       throw HttpException('HTTP ${res.statusCode}', uri: Uri.parse(url));
+    }
     return utf8.decode(bytes);
   }
 

@@ -73,8 +73,9 @@ class _EditorHomeState extends State<EditorHome> {
   }
 
   void notify(String text) {
-    if (mounted)
+    if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+    }
   }
 
   Future<void> loadGame() async {
@@ -100,11 +101,12 @@ class _EditorHomeState extends State<EditorHome> {
       });
       if (data.versions.isNotEmpty) await loadVersion(data.versions.first);
     } catch (e) {
-      if (mounted && request == generation)
+      if (mounted && request == generation) {
         setState(() {
           busy = false;
           error = '读取失败：$e';
         });
+      }
     }
   }
 
@@ -132,11 +134,12 @@ class _EditorHomeState extends State<EditorHome> {
       });
       clearForm();
     } catch (e) {
-      if (mounted && request == generation)
+      if (mounted && request == generation) {
         setState(() {
           busy = false;
           error = '人工数据加载失败：$e';
         });
+      }
     }
   }
 
@@ -165,8 +168,9 @@ class _EditorHomeState extends State<EditorHome> {
       );
       if (upcoming) {
         final number = int.tryParse(phase.text);
-        if (number == null || number < 1 || number > 9)
+        if (number == null || number < 1 || number > 9) {
           throw const FormatException('期数应为 1～9');
+        }
         final match = <String, dynamic>{'phase': number, 'poolType': poolType};
         if (game == Game.starrail) {
           match['bannerName'] = requiredText(matchName.text, '卡池名称');
@@ -200,8 +204,9 @@ class _EditorHomeState extends State<EditorHome> {
       final doc = document!;
       doc.validate();
       final path = outputPath.text.trim();
-      if (path.isEmpty || !File(path).isAbsolute)
+      if (path.isEmpty || !File(path).isAbsolute) {
         throw const FormatException('请输入绝对文件路径');
+      }
       final target = File(path);
       if (await target.exists()) throw const FormatException('目标文件已存在，禁止覆盖');
       await target.writeAsString(doc.formatted, flush: true);
@@ -349,11 +354,12 @@ class _EditorHomeState extends State<EditorHome> {
                             )
                             .toList(),
                         onChanged: (id) {
-                          if (id != null)
+                          if (id != null) {
                             setState(() {
                               selected = banners.firstWhere((b) => b.id == id);
                               clearForm();
                             });
+                          }
                         },
                       ),
                     if (upcoming) ...[
