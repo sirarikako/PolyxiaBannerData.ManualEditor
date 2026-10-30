@@ -87,6 +87,13 @@ jobs:
       - name: Analyze the project
         run: flutter analyze --no-pub
 
+      - name: Show Dart analyzer fixes without bypassing checks
+        if: failure()
+        run: |
+          dart fix --apply
+          dart format lib/main.dart lib/manual_data.dart test/manual_data_test.dart test/widget_test.dart
+          git diff -- lib/main.dart lib/manual_data.dart test/manual_data_test.dart test/widget_test.dart
+
       - name: Run Flutter tests
         run: flutter test --no-pub
 
